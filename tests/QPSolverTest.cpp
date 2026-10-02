@@ -1732,3 +1732,53 @@ BOOST_AUTO_TEST_CASE(QPTransformTaskTest)
   solver.removeTask(&postureTask);
   BOOST_CHECK_EQUAL(solver.nrTasks(), 0);
 }
+
+BOOST_AUTO_TEST_CASE(QPManipulabilityTaskTest)
+{
+  using namespace Eigen;
+  using namespace sva;
+  using namespace rbd;
+  using namespace tasks;
+
+  MultiBody mb;
+  MultiBodyConfig mbcInit;
+
+  std::tie(mb, mbcInit) = makeZXZArm();
+  mbcInit.q = {{}, {0.}, {0.3}, {0.4}};
+  forwardKinematics(mb, mbcInit);
+  forwardVelocity(mb, mbcInit);
+
+  std::vector<MultiBody> mbs = {mb};
+  std::vector<MultiBodyConfig> mbcs = {mbcInit};
+
+  qp::QPSolver solver;
+  solver.nrVars(mbs, {}, {});
+  solver.updateConstrSize();
+
+  // Manipulability of a point beyond the last joint, in translation
+  Vector6d translation;
+  translation << 0., 0., 0., 1., 1., 1.;
+  qp::ManipulabilityTask manipTask(mbs, 0, "b3", PTransformd(Vector3d(0., 0.5, 0.)), {}, translation);
+  BOOST_CHECK_EQUAL(manipTask.dim(), 1);
+  manipTask.update(mbs, mbcs, solver.data());
+  const double w0 = manipTask.manipulability();
+  // w0 is about 0.18, and the arm can reach about 0.32
+  manipTask.target(0.25);
+  qp::SetPointTask manipTaskSp(mbs, 0, &manipTask, 10., 1.);
+  qp::PostureTask postureTask(mbs, 0, mbcInit.q, 0., 1e-3);
+  postureTask.gains(0., 2.);
+  solver.addTask(&manipTaskSp);
+  solver.addTask(&postureTask);
+
+  for(int i = 0; i < 10000; ++i)
+  {
+    BOOST_REQUIRE(solver.solve(mbs, mbcs));
+    integration(mb, mbcs[0], 0.001);
+    forwardKinematics(mb, mbcs[0]);
+    forwardVelocity(mb, mbcs[0]);
+  }
+  manipTask.update(mbs, mbcs, solver.data());
+  BOOST_CHECK_LT(w0, 0.2);
+  BOOST_CHECK_SMALL(manipTask.eval().norm(), 1e-4);
+  BOOST_CHECK_SMALL(manipTask.speed().norm(), 1e-4);
+}

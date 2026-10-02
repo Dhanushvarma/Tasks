@@ -1119,6 +1119,39 @@ private:
   int robotIndex_;
 };
 
+class TASKS_DLLAPI ManipulabilityTask : public HighLevelTask
+{
+public:
+  /** See tasks::ManipulabilityTask */
+  ManipulabilityTask(const std::vector<rbd::MultiBody> & mbs,
+                     int robotIndex,
+                     const std::string & bodyName,
+                     const sva::PTransformd & X_b_f = sva::PTransformd::Identity(),
+                     const std::vector<std::string> & measureJoints = {},
+                     const Eigen::Vector6d & axes = Eigen::Vector6d::Ones(),
+                     ManipulabilityMeasure measure = ManipulabilityMeasure::Yoshikawa);
+
+  tasks::ManipulabilityTask & task() { return mt_; }
+
+  void target(double target) { mt_.target(target); }
+  double target() const { return mt_.target(); }
+  double manipulability() const { return mt_.manipulability(); }
+
+  virtual int dim() override;
+  virtual void update(const std::vector<rbd::MultiBody> & mbs,
+                      const std::vector<rbd::MultiBodyConfig> & mbcs,
+                      const SolverData & data) override;
+
+  virtual const Eigen::MatrixXd & jac() const override;
+  virtual const Eigen::VectorXd & eval() const override;
+  virtual const Eigen::VectorXd & speed() const override;
+  virtual const Eigen::VectorXd & normalAcc() const override;
+
+private:
+  tasks::ManipulabilityTask mt_;
+  int robotIndex_;
+};
+
 } // namespace qp
 
 } // namespace tasks

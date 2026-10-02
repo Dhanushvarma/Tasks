@@ -1529,6 +1529,41 @@ const Eigen::VectorXd & VectorOrientationTask::speed() const
 const Eigen::VectorXd & VectorOrientationTask::normalAcc() const
 { return vot_.normalAcc(); }
 
+/**
+ *											ManipulabilityTask
+ */
+
+ManipulabilityTask::ManipulabilityTask(const std::vector<rbd::MultiBody> & mbs,
+                                       int rI,
+                                       const std::string & bodyName,
+                                       const sva::PTransformd & X_b_f,
+                                       const std::vector<std::string> & measureJoints,
+                                       const Eigen::Vector6d & axes,
+                                       ManipulabilityMeasure measure)
+: mt_(mbs[rI], bodyName, X_b_f, measureJoints, axes, measure), robotIndex_(rI)
+{
+}
+
+int ManipulabilityTask::dim()
+{ return 1; }
+
+void ManipulabilityTask::update(const std::vector<rbd::MultiBody> & mbs,
+                                const std::vector<rbd::MultiBodyConfig> & mbcs,
+                                const SolverData & /* data */)
+{ mt_.update(mbs[robotIndex_], mbcs[robotIndex_]); }
+
+const Eigen::MatrixXd & ManipulabilityTask::jac() const
+{ return mt_.jac(); }
+
+const Eigen::VectorXd & ManipulabilityTask::eval() const
+{ return mt_.eval(); }
+
+const Eigen::VectorXd & ManipulabilityTask::speed() const
+{ return mt_.speed(); }
+
+const Eigen::VectorXd & ManipulabilityTask::normalAcc() const
+{ return mt_.normalAcc(); }
+
 } // namespace qp
 
 } // namespace tasks
