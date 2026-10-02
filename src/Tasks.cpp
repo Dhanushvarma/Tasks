@@ -7,8 +7,11 @@
 
 // includes
 // std
+#include <algorithm>
 #include <numeric>
 #include <set>
+#include <sstream>
+#include <stdexcept>
 
 // rbd
 #include <RBDyn/MultiBody.h>
@@ -1351,6 +1354,297 @@ const Eigen::VectorXd & VectorOrientationTask::normalAcc() const
 { return normalAcc_; }
 
 const Eigen::MatrixXd & VectorOrientationTask::jac() const
+{ return jacMat_; }
+
+/**
+ *													ManipulabilityTask
+ */
+
+ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
+                                       const std::string & bodyName,
+                                       const sva::PTransformd & X_b_f,
+                                       const std::vector<std::string> & measureJoints,
+                                       const Eigen::Vector6d & axes,
+                                       ManipulabilityMeasure measure)
+: bodyIndex_(mb.sBodyIndexByName(bodyName)), X_b_f_(X_b_f), jac_(mb, bodyName), measure_(measure), axes_(axes),
+  maxTaskVelocity_(Eigen::Vector6d::Ones()), target_(0.), w_(0.), eval_(1), speed_(1), normalAcc_(1),
+  jacMat_(1, mb.nrDof())
+{
+  const std::vector<int> & path = jac_.jointsPath();
+  int col = 0;
+  for(int j : path)
+  {
+    pathDof_.push_back(mb.joint(j).dof());
+    pathCol_.push_back(col);
+    col += mb.joint(j).dof();
+  }
+
+  // Path indices of the measure joints, in path order
+  std::vector<std::size_t> measurePath;
+  if(measureJoints.empty())
+  {
+    for(std::size_t i = 0; i < path.size(); ++i)
+    {
+      const rbd::Joint & joint = mb.joint(path[i]);
+      if(joint.dof() == 0 || (path[i] == 0 && joint.type() == rbd::Joint::Free)) { continue; }
+      measurePath.push_back(i);
+    }
+  }
+  else
+  {
+    for(const auto & name : measureJoints)
+    {
+      auto it = std::find_if(path.begin(), path.end(), [&](int j) { return mb.joint(j).name() == name; });
+      if(it == path.end())
+      {
+        std::ostringstream str;
+        str << "ManipulabilityTask: joint " << name << " is not between the root and body " << bodyName;
+        throw std::domain_error(str.str());
+      }
+      auto i = static_cast<std::size_t>(std::distance(path.begin(), it));
+      if(pathDof_[i] == 0)
+      {
+        std::ostringstream str;
+        str << "ManipulabilityTask: joint " << name << " has no degree of freedom";
+        throw std::domain_error(str.str());
+      }
+      if(std::find(measurePath.begin(), measurePath.end(), i) != measurePath.end())
+      {
+        std::ostringstream str;
+        str << "ManipulabilityTask: joint " << name << " is given twice";
+        throw std::domain_error(str.str());
+      }
+      measurePath.push_back(i);
+    }
+    std::sort(measurePath.begin(), measurePath.end());
+  }
+  for(std::size_t i : measurePath)
+  {
+    measureJoints_.push_back(mb.joint(path[i]).name());
+    for(int d = 0; d < pathDof_[i]; ++d) { cols_.push_back(pathCol_[i] + d); }
+  }
+  for(int r = 0; r < 6; ++r)
+  {
+    if(axes_(r) != 0.) { rows_.push_back(r); }
+  }
+  if(rows_.empty() || rows_.size() > cols_.size())
+  {
+    std::ostringstream str;
+    str << "ManipulabilityTask: " << rows_.size() << " axes are selected but the measure joints have " << cols_.size()
+        << " degrees of freedom, select between 1 and " << cols_.size() << " axes";
+    throw std::domain_error(str.str());
+  }
+
+  const auto nRows = static_cast<Eigen::Index>(rows_.size());
+  const auto nCols = static_cast<Eigen::Index>(cols_.size());
+  maxJointVelocity_.setOnes(nCols);
+  alpha_.resize(col);
+  jacDot_.resize(6, col);
+  jacDDot_.resize(6, col);
+  G_.resize(6, col);
+  grad_.resize(1, col);
+  Jt_.resize(nRows, nCols);
+  Dt_.resize(nRows, nCols);
+  Gt_.resize(nRows, nCols);
+  Dh_.resize(nRows, nCols);
+  svd_ = Eigen::JacobiSVD<Eigen::MatrixXd>(nRows, nCols, Eigen::ComputeFullU | Eigen::ComputeFullV);
+}
+
+void ManipulabilityTask::update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc)
+{
+  const std::vector<int> & path = jac_.jointsPath();
+  // Frame Jacobian in frame coordinates, columns ordered as the path
+  const Eigen::MatrixXd & J = jac_.jacobian(mb, mbc, X_b_f_ * mbc.bodyPosW[bodyIndex_]);
+
+  for(std::size_t i = 0; i < path.size(); ++i)
+  {
+    for(int d = 0; d < pathDof_[i]; ++d) { alpha_(pathCol_[i] + d) = mbc.alpha[path[i]][d]; }
+  }
+
+  auto cross = [](const Eigen::Vector6d & a, const Eigen::Vector6d & b) -> Eigen::Vector6d
+  { return (sva::MotionVecd(a).cross(sva::MotionVecd(b))).vector(); };
+
+  // Column i of the frame Jacobian only depends on the joints after its own joint (dJ_i/dq_k = J_i x J_k), so
+  // Jdot_i = J_i x W_i and Jddot_i = Jdot_i x W_i + J_i x Wdot_i (with zero joint accelerations), where
+  // W_i = sum_{k after i} J_k alpha_k is the frame velocity relative to the body of joint i.
+  Eigen::Vector6d W = Eigen::Vector6d::Zero();
+  Eigen::Vector6d WDot = Eigen::Vector6d::Zero();
+  for(auto i = path.size(); i-- > 0;)
+  {
+    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    {
+      jacDot_.col(c) = cross(J.col(c), W);
+      jacDDot_.col(c) = cross(jacDot_.col(c), W) + cross(J.col(c), WDot);
+    }
+    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    {
+      W += J.col(c) * alpha_(c);
+      WDot += jacDot_.col(c) * alpha_(c);
+    }
+  }
+
+  for(std::size_t r = 0; r < rows_.size(); ++r)
+  {
+    for(std::size_t c = 0; c < cols_.size(); ++c)
+    {
+      double scale = maxJointVelocity_(static_cast<Eigen::Index>(c)) / maxTaskVelocity_(rows_[r]);
+      Jt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = scale * J(rows_[r], cols_[c]);
+      Dt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = scale * jacDot_(rows_[r], cols_[c]);
+    }
+  }
+  svd_.compute(Jt_);
+
+  double d2w = 0.;
+  switch(measure_)
+  {
+    case ManipulabilityMeasure::Yoshikawa:
+      d2w = computeYoshikawa();
+      break;
+  }
+
+  // Gradient of w with respect to the frame Jacobian
+  G_.setZero();
+  for(std::size_t r = 0; r < rows_.size(); ++r)
+  {
+    for(std::size_t c = 0; c < cols_.size(); ++c)
+    {
+      double scale = maxJointVelocity_(static_cast<Eigen::Index>(c)) / maxTaskVelocity_(rows_[r]);
+      G_(rows_[r], cols_[c]) = scale * Gt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c));
+    }
+  }
+
+  // dw/dq_k = sum_{i before k} <G_i, J_i x J_k>, evaluated with prefix sums over the path
+  Eigen::Vector3d A = Eigen::Vector3d::Zero();
+  Eigen::Vector3d B = Eigen::Vector3d::Zero();
+  for(std::size_t i = 0; i < path.size(); ++i)
+  {
+    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    {
+      grad_(0, c) = J.col(c).head<3>().dot(A) + J.col(c).tail<3>().dot(B);
+    }
+    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    {
+      A += G_.col(c).head<3>().cross(J.col(c).head<3>()) + G_.col(c).tail<3>().cross(J.col(c).tail<3>());
+      B += G_.col(c).tail<3>().cross(J.col(c).head<3>());
+    }
+  }
+
+  eval_(0) = target_ - w_;
+  speed_(0) = grad_.row(0).dot(alpha_);
+  normalAcc_(0) = d2w + G_.cwiseProduct(jacDDot_).sum();
+  jac_.fullJacobian(mb, grad_, jacMat_);
+}
+
+double ManipulabilityTask::computeYoshikawa()
+{
+  const Eigen::VectorXd & s = svd_.singularValues();
+  const Eigen::MatrixXd & U = svd_.matrixU();
+  const Eigen::MatrixXd & V = svd_.matrixV();
+  const Eigen::Index r = s.size();
+
+  // Product of the singular values but the i-th (and j-th), without divisions so it stays finite at singularities
+  auto prodBut = [&](Eigen::Index i, Eigen::Index j)
+  {
+    double p = 1.;
+    for(Eigen::Index l = 0; l < r; ++l)
+    {
+      if(l != i && l != j) { p *= s(l); }
+    }
+    return p;
+  };
+
+  w_ = prodBut(-1, -1);
+  // dw/dJt = U diag(dw/dsigma_i) V^T
+  Gt_.setZero();
+  for(Eigen::Index i = 0; i < r; ++i) { Gt_.noalias() += prodBut(i, -1) * U.col(i) * V.col(i).transpose(); }
+
+  // Second derivative of w along Dt: with Dh = U^T Dt V and M its first r columns,
+  // d2w = sum_{i != j} (M_ii M_jj - M_ij M_ji) prod_{l != i,j} sigma_l
+  //     + sum_i |Dh_i,r:|^2 prod_{l != i} sigma_l / sigma_i
+  // The last term diverges at singular redundant configurations, sigma_i is bounded below there.
+  Dh_.noalias() = U.transpose() * Dt_ * V;
+  double d2w = 0.;
+  for(Eigen::Index i = 0; i < r; ++i)
+  {
+    for(Eigen::Index j = 0; j < r; ++j)
+    {
+      if(i != j) { d2w += (Dh_(i, i) * Dh_(j, j) - Dh_(i, j) * Dh_(j, i)) * prodBut(i, j); }
+    }
+  }
+  if(Dh_.cols() > r)
+  {
+    const double sigmaMin = 1e-3 * s(0);
+    for(Eigen::Index i = 0; i < r; ++i)
+    {
+      double sigma = std::max(s(i), sigmaMin);
+      if(sigma > 0.) { d2w += Dh_.row(i).tail(Dh_.cols() - r).squaredNorm() * prodBut(i, -1) / sigma; }
+    }
+  }
+  return d2w;
+}
+
+void ManipulabilityTask::target(double target)
+{ target_ = target; }
+
+double ManipulabilityTask::target() const
+{ return target_; }
+
+double ManipulabilityTask::manipulability() const
+{ return w_; }
+
+void ManipulabilityTask::maxTaskVelocity(const Eigen::Vector6d & velocity)
+{
+  for(int r : rows_)
+  {
+    if(!(velocity(r) > 0.)) { throw std::domain_error("ManipulabilityTask: maximum task velocities must be positive"); }
+  }
+  maxTaskVelocity_ = velocity;
+}
+
+const Eigen::Vector6d & ManipulabilityTask::maxTaskVelocity() const
+{ return maxTaskVelocity_; }
+
+void ManipulabilityTask::maxJointVelocity(const Eigen::VectorXd & velocity)
+{
+  if(velocity.size() != maxJointVelocity_.size())
+  {
+    std::ostringstream str;
+    str << "ManipulabilityTask: " << velocity.size() << " maximum joint velocities given, expected "
+        << maxJointVelocity_.size();
+    throw std::domain_error(str.str());
+  }
+  if(!(velocity.array() > 0.).all())
+  {
+    throw std::domain_error("ManipulabilityTask: maximum joint velocities must be positive");
+  }
+  maxJointVelocity_ = velocity;
+}
+
+const Eigen::VectorXd & ManipulabilityTask::maxJointVelocity() const
+{ return maxJointVelocity_; }
+
+ManipulabilityMeasure ManipulabilityTask::measure() const
+{ return measure_; }
+
+const Eigen::Vector6d & ManipulabilityTask::axes() const
+{ return axes_; }
+
+const std::vector<std::string> & ManipulabilityTask::measureJoints() const
+{ return measureJoints_; }
+
+int ManipulabilityTask::measureDof() const
+{ return static_cast<int>(cols_.size()); }
+
+const Eigen::VectorXd & ManipulabilityTask::eval() const
+{ return eval_; }
+
+const Eigen::VectorXd & ManipulabilityTask::speed() const
+{ return speed_; }
+
+const Eigen::VectorXd & ManipulabilityTask::normalAcc() const
+{ return normalAcc_; }
+
+const Eigen::MatrixXd & ManipulabilityTask::jac() const
 { return jacMat_; }
 
 } // namespace tasks

@@ -4,6 +4,7 @@
 
 // includes
 // std
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <tuple>
@@ -524,4 +525,207 @@ BOOST_AUTO_TEST_CASE(VectorOrientationTaskTest)
   tasks::VectorOrientationTask vot(mb, "b3", Vector3d::Random(), Vector3d::Random());
 
   testTaskNumDiff(mb, mbc, vot, NormalAccUpdater<tasks::VectorOrientationTask>(mb), VectOriTester());
+}
+
+/// @return A branched arm with every RBDyn joint type on the path to "b7" and a side branch "b8"
+std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeManipulabilityArm(bool isFixed)
+{
+  using namespace Eigen;
+  using namespace sva;
+  using namespace rbd;
+
+  MultiBodyGraph mbg;
+  RBInertiad rbi(1., Vector3d::Zero(), Matrix3d::Identity());
+  for(int i = 0; i < 9; ++i) { mbg.addBody(Body(rbi, "b" + std::to_string(i))); }
+
+  mbg.addJoint(Joint(Joint::Rev, Vector3d(0., 0., 1.), true, "j1"));
+  mbg.addJoint(Joint(Joint::Spherical, true, "j2"));
+  mbg.addJoint(Joint(Joint::Prism, Vector3d(1., 0., 0.), true, "j3"));
+  mbg.addJoint(Joint(Joint::Rev, Vector3d(0., 1., 0.), false, "j4"));
+  mbg.addJoint(Joint(Joint::Planar, true, "j5"));
+  mbg.addJoint(Joint(Joint::Cylindrical, Vector3d(1., 1., 0.).normalized(), true, "j6"));
+  mbg.addJoint(Joint(Joint::Rev, Vector3d(1., 0., 0.), true, "j7"));
+  mbg.addJoint(Joint(Joint::Rev, Vector3d(0., 0., 1.), true, "j8"));
+
+  auto offset = [](double rx, double rz, const Vector3d & t) { return PTransformd(RotX(rx) * RotZ(rz), t); };
+  mbg.linkBodies("b0", offset(0.1, 0.2, Vector3d(0., 0., 0.3)), "b1", PTransformd::Identity(), "j1");
+  mbg.linkBodies("b1", offset(-0.3, 0.5, Vector3d(0.1, 0.2, 0.4)), "b2", PTransformd::Identity(), "j2");
+  mbg.linkBodies("b2", offset(0.7, -0.2, Vector3d(0.3, -0.1, 0.)), "b3", PTransformd::Identity(), "j3");
+  mbg.linkBodies("b3", offset(0.2, 0.9, Vector3d(0., 0.4, 0.1)), "b4", PTransformd::Identity(), "j4");
+  mbg.linkBodies("b4", offset(-0.6, 0.1, Vector3d(0.2, 0., 0.3)), "b5", PTransformd::Identity(), "j5");
+  mbg.linkBodies("b5", offset(0.4, -0.7, Vector3d(0.1, 0.3, 0.)), "b6", PTransformd::Identity(), "j6");
+  mbg.linkBodies("b6", offset(-0.2, 0.3, Vector3d(0.25, 0., 0.15)), "b7", PTransformd::Identity(), "j7");
+  mbg.linkBodies("b3", offset(0., 0., Vector3d(0., -0.3, 0.)), "b8", PTransformd::Identity(), "j8");
+
+  MultiBody mb = mbg.makeMultiBody("b0", isFixed);
+  MultiBodyConfig mbc(mb);
+  mbc.zero(mb);
+  return std::make_tuple(mb, mbc);
+}
+
+/// Random valid configuration (unit quaternions) with random velocity and acceleration
+void randomManipulabilityState(const rbd::MultiBody & mb, rbd::MultiBodyConfig & mbc)
+{
+  mbc.zero(mb);
+  rbd::vectorToParam(Eigen::VectorXd::Random(mb.nrDof()), mbc.alpha);
+  rbd::integration(mb, mbc, 1.);
+  rbd::vectorToParam(Eigen::VectorXd::Random(mb.nrDof()), mbc.alpha);
+  rbd::vectorToParam(Eigen::VectorXd::Random(mb.nrDof()), mbc.alphaD);
+  rbd::forwardKinematics(mb, mbc);
+  rbd::forwardVelocity(mb, mbc);
+}
+
+/// Update the task after integrating mbc over step (backward in time if step is negative)
+void updateAfterStep(const rbd::MultiBody & mb,
+                     const rbd::MultiBodyConfig & mbc,
+                     double step,
+                     tasks::ManipulabilityTask & task)
+{
+  rbd::MultiBodyConfig mbcStep(mbc);
+  if(step < 0) { rbd::vectorToParam(-rbd::dofToVector(mb, mbcStep.alpha), mbcStep.alpha); }
+  rbd::integration(mb, mbcStep, std::abs(step));
+  if(step < 0) { rbd::vectorToParam(-rbd::dofToVector(mb, mbcStep.alpha), mbcStep.alpha); }
+  rbd::forwardKinematics(mb, mbcStep);
+  rbd::forwardVelocity(mb, mbcStep);
+  task.update(mb, mbcStep);
+}
+
+/// Check jac, speed and normalAcc against central differences
+///
+/// testTaskNumDiff uses forward differences and random joint parameters, which are not valid for free and spherical
+/// joints, and the manipulability of the larger arm is not small enough for the forward difference error to be below
+/// tolerance
+void testManipulabilityNumDiff(const rbd::MultiBody & mb,
+                               const rbd::MultiBodyConfig & mbcInit,
+                               tasks::ManipulabilityTask & task,
+                               int nrIter = 50)
+{
+  const double diffStep = 1e-5;
+  const double tol = 1e-4;
+  rbd::MultiBodyConfig mbcCur(mbcInit);
+  for(int iter = 0; iter < nrIter; ++iter)
+  {
+    randomManipulabilityState(mb, mbcCur);
+    task.update(mb, mbcCur);
+    BOOST_REQUIRE(std::isfinite(task.manipulability()));
+    const Eigen::MatrixXd jac = task.jac();
+    Eigen::VectorXd speedCur = -task.speed();
+    Eigen::VectorXd alphaD = rbd::dofToVector(mb, mbcCur.alphaD);
+    Eigen::VectorXd accCur = -task.normalAcc() - task.jac() * alphaD;
+
+    // Gradient, moving along each degree of freedom
+    rbd::MultiBodyConfig mbcDof(mbcCur);
+    rbd::vectorToParam(Eigen::VectorXd::Zero(mb.nrDof()), mbcDof.alphaD);
+    Eigen::VectorXd gradDiff(mb.nrDof());
+    for(int k = 0; k < mb.nrDof(); ++k)
+    {
+      rbd::vectorToParam(Eigen::VectorXd::Unit(mb.nrDof(), k), mbcDof.alpha);
+      updateAfterStep(mb, mbcDof, diffStep, task);
+      double wPost = task.manipulability();
+      updateAfterStep(mb, mbcDof, -diffStep, task);
+      gradDiff(k) = (wPost - task.manipulability()) / (2 * diffStep);
+    }
+    BOOST_CHECK_SMALL((jac.row(0).transpose() - gradDiff).norm(), tol);
+
+    // Speed and acceleration, moving along the current velocity and acceleration
+    updateAfterStep(mb, mbcCur, diffStep, task);
+    Eigen::VectorXd evalPost = task.eval();
+    Eigen::VectorXd speedPost = -task.speed();
+    updateAfterStep(mb, mbcCur, -diffStep, task);
+    Eigen::VectorXd speedDiff = (evalPost - task.eval()) / (2 * diffStep);
+    Eigen::VectorXd accDiff = (speedPost + task.speed()) / (2 * diffStep);
+
+    BOOST_CHECK_SMALL((speedCur - speedDiff).norm(), tol);
+    BOOST_CHECK_SMALL((accCur - accDiff).norm(), tol);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(ManipulabilityTaskTest)
+{
+  using namespace Eigen;
+  using namespace rbd;
+
+  MultiBody mb;
+  MultiBodyConfig mbc;
+  const sva::PTransformd X_b_f(sva::RotY(0.4) * sva::RotZ(-0.3), Vector3d(0.1, -0.05, 0.2));
+
+  // Revolute arm, translation only
+  std::tie(mb, mbc) = makeZXZArm();
+  Vector6d translation;
+  translation << 0., 0., 0., 1., 1., 1.;
+  tasks::ManipulabilityTask zxz(mb, "b3", X_b_f, {}, translation);
+  BOOST_CHECK_EQUAL(zxz.measureDof(), 3);
+  testManipulabilityNumDiff(mb, mbc, zxz);
+
+  for(bool isFixed : {true, false})
+  {
+    std::tie(mb, mbc) = makeManipulabilityArm(isFixed);
+
+    // Default measure joints: the path to b7 without the free root joint, all axes
+    tasks::ManipulabilityTask all(mb, "b7", X_b_f);
+    BOOST_CHECK_EQUAL(all.measureJoints().size(), 7);
+    BOOST_CHECK_EQUAL(all.measureDof(), 12);
+    testManipulabilityNumDiff(mb, mbc, all);
+
+    // Translation only, and an [rz x y z] selection
+    tasks::ManipulabilityTask trans(mb, "b7", X_b_f, {}, translation);
+    testManipulabilityNumDiff(mb, mbc, trans);
+    Vector6d scara;
+    scara << 0., 0., 1., 1., 1., 1.;
+    tasks::ManipulabilityTask scaraTask(mb, "b7", X_b_f, {}, scara);
+    testManipulabilityNumDiff(mb, mbc, scaraTask);
+
+    // Measure joints with non measure joints in between and after, and velocity normalization
+    tasks::ManipulabilityTask subset(mb, "b7", X_b_f, {"j6", "j2", "j3", "j1"});
+    BOOST_CHECK_EQUAL(subset.measureJoints().front(), "j1");
+    BOOST_CHECK_EQUAL(subset.measureJoints().back(), "j6");
+    BOOST_CHECK_EQUAL(subset.measureDof(), 7);
+    Vector6d maxTaskVelocity;
+    maxTaskVelocity << 2., 2., 2., 0.5, 0.5, 0.5;
+    subset.maxTaskVelocity(maxTaskVelocity);
+    subset.maxJointVelocity(VectorXd::LinSpaced(7, 0.5, 2.));
+    testManipulabilityNumDiff(mb, mbc, subset);
+
+    if(!isFixed)
+    {
+      // The measure is computed in frame coordinates: moving the floating base does not change it
+      randomManipulabilityState(mb, mbc);
+      all.update(mb, mbc);
+      BOOST_CHECK_SMALL(all.jac().block(0, 0, 1, 6).norm(), 1e-10);
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(ManipulabilityTaskSingularTest)
+{
+  using namespace Eigen;
+  using namespace rbd;
+
+  MultiBody mb;
+  MultiBodyConfig mbc;
+  std::tie(mb, mbc) = makeManipulabilityArm(true);
+  forwardKinematics(mb, mbc);
+  forwardVelocity(mb, mbc);
+
+  // j1 and j7 alone cannot rotate the frame about three axes: w is 0 in every configuration
+  Vector6d rotation;
+  rotation << 1., 1., 1., 0., 0., 0.;
+  tasks::ManipulabilityTask singular(mb, "b7", sva::PTransformd::Identity(), {"j1", "j3", "j7"}, rotation);
+  for(int i = 0; i < 10; ++i)
+  {
+    randomManipulabilityState(mb, mbc);
+    singular.update(mb, mbc);
+    BOOST_CHECK_SMALL(singular.manipulability(), 1e-10);
+    BOOST_CHECK(singular.jac().allFinite());
+    BOOST_CHECK(singular.speed().allFinite());
+    BOOST_CHECK(singular.normalAcc().allFinite());
+  }
+
+  // Invalid definitions
+  BOOST_CHECK_THROW(tasks::ManipulabilityTask(mb, "b7", sva::PTransformd::Identity(), {"j8"}), std::domain_error);
+  BOOST_CHECK_THROW(tasks::ManipulabilityTask(mb, "b7", sva::PTransformd::Identity(), {"j1", "j1"}), std::domain_error);
+  BOOST_CHECK_THROW(tasks::ManipulabilityTask(mb, "b7", sva::PTransformd::Identity(), {"j1", "j7"}), std::domain_error);
+  tasks::ManipulabilityTask task(mb, "b7");
+  BOOST_CHECK_THROW(task.maxJointVelocity(VectorXd::Ones(3)), std::domain_error);
+  BOOST_CHECK_THROW(task.maxTaskVelocity(Vector6d::Zero()), std::domain_error);
 }
