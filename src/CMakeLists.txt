@@ -4,6 +4,7 @@
 
 set(SOURCES
     Tasks.cpp
+    SPDManifold.cpp
     QPSolver.cpp
     QPTasks.cpp
     QPConstr.cpp
@@ -16,6 +17,7 @@ set(SOURCES
 )
 set(HEADERS
     Tasks/Tasks.h
+    Tasks/SPDManifold.h
     Tasks/QPSolver.h
     Tasks/QPTasks.h
     Tasks/QPConstr.h

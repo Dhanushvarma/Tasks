@@ -685,6 +685,89 @@ private:
   Eigen::MatrixXd jacMat_;
 };
 
+/** Jacobian of a frame in its own coordinates, over the joints between the root and the frame body, with its time
+ * derivatives. It also holds the measure joints (Jacobian columns) and the selected axes (Jacobian rows) of a
+ * manipulability task.
+ *
+ * The column of a path degree of freedom c only depends on the joints after its own joint,
+ * \f$ \partial J_c / \partial q_k = J_c \times J_k \f$ (motion cross product) for k after c, so the time derivatives
+ * come from one backward pass over the path.
+ */
+class TASKS_DLLAPI FrameJacobianDerivatives
+{
+public:
+  /**
+   * @param mb Robot
+   * @param bodyName Body the frame is attached to
+   * @param X_b_f Frame pose in body coordinates
+   * @param measureJoints Measure joints. If empty, every joint between the root and the body, excluding a free root
+   * joint (floating base)
+   * @param axes Selected axes, ordered as sva::MotionVecd (rotation then translation). A non-zero entry selects the
+   * axis
+   * @param owner Name used in error messages
+   * @throw std::domain_error if a measure joint is not between the root and the body, appears twice or has no degree of
+   * freedom, or if more axes are selected than measure joints degrees of freedom
+   */
+  FrameJacobianDerivatives(const rbd::MultiBody & mb,
+                           const std::string & bodyName,
+                           const sva::PTransformd & X_b_f,
+                           const std::vector<std::string> & measureJoints,
+                           const Eigen::Vector6d & axes,
+                           const std::string & owner);
+
+  /** Compute the frame pose, the frame Jacobian, its time derivative and its second time derivative at zero joint
+   * acceleration */
+  void update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc);
+
+  /** Frame Jacobian in frame coordinates, one column per path degree of freedom */
+  const Eigen::MatrixXd & jacobian() const { return J_; }
+  /** Time derivative of jacobian() */
+  const Eigen::MatrixXd & jacobianDot() const { return jacDot_; }
+  /** Second time derivative of jacobian() at zero joint acceleration */
+  const Eigen::MatrixXd & jacobianDDot() const { return jacDDot_; }
+  /** Velocity of the path degrees of freedom */
+  const Eigen::VectorXd & alpha() const { return alpha_; }
+  /** Frame pose in world coordinates */
+  const sva::PTransformd & X_0_f() const { return X_0_f_; }
+
+  /** Number of degrees of freedom of each joint of the path */
+  const std::vector<int> & jointDof() const { return jointDof_; }
+  /** First path column of each joint of the path */
+  const std::vector<int> & jointCol() const { return jointCol_; }
+  /** Index in the path of the joint of each path column */
+  const std::vector<int> & colJoint() const { return colJoint_; }
+  /** Selected axes */
+  const std::vector<int> & rows() const { return rows_; }
+  /** Path columns of the measure joints */
+  const std::vector<int> & cols() const { return cols_; }
+  /** Measure joints, ordered from the root to the body */
+  const std::vector<std::string> & measureJoints() const { return measureJoints_; }
+  const Eigen::Vector6d & axes() const { return axes_; }
+
+  /** Copy a matrix with one column per path degree of freedom into a matrix with one column per robot degree of
+   * freedom */
+  void fullJacobian(const rbd::MultiBody & mb, const Eigen::MatrixXd & pathMat, Eigen::MatrixXd & fullMat) const;
+
+private:
+  int bodyIndex_;
+  sva::PTransformd X_b_f_;
+  rbd::Jacobian jac_;
+  Eigen::Vector6d axes_;
+  std::vector<std::string> measureJoints_;
+
+  std::vector<int> jointDof_;
+  std::vector<int> jointCol_;
+  std::vector<int> colJoint_;
+  std::vector<int> rows_;
+  std::vector<int> cols_;
+
+  sva::PTransformd X_0_f_;
+  Eigen::MatrixXd J_;
+  Eigen::MatrixXd jacDot_;
+  Eigen::MatrixXd jacDDot_;
+  Eigen::VectorXd alpha_;
+};
+
 /** Manipulability measures supported by ManipulabilityTask */
 enum class ManipulabilityMeasure
 {
@@ -771,29 +854,15 @@ private:
   double computeYoshikawa();
 
 private:
-  int bodyIndex_;
-  sva::PTransformd X_b_f_;
-  rbd::Jacobian jac_;
+  FrameJacobianDerivatives frameJac_;
   ManipulabilityMeasure measure_;
-  Eigen::Vector6d axes_;
-  std::vector<std::string> measureJoints_;
-
-  /** Number of dof of each joint of the path and index of its first column in the path Jacobian */
-  std::vector<int> pathDof_;
-  std::vector<int> pathCol_;
-  /** Selected rows of the frame Jacobian and path Jacobian columns of the measure joints */
-  std::vector<int> rows_;
-  std::vector<int> cols_;
 
   Eigen::Vector6d maxTaskVelocity_;
   Eigen::VectorXd maxJointVelocity_;
   double target_;
   double w_;
 
-  /** Path quantities: velocity, Jacobian time derivatives and gradient of w */
-  Eigen::VectorXd alpha_;
-  Eigen::MatrixXd jacDot_;
-  Eigen::MatrixXd jacDDot_;
+  /** Gradient of w with respect to the frame Jacobian and to the path degrees of freedom */
   Eigen::MatrixXd G_;
   Eigen::MatrixXd grad_;
   /** Normalized Jacobian, its time derivative and the gradient of w with respect to it */
@@ -803,6 +872,139 @@ private:
   Eigen::JacobiSVD<Eigen::MatrixXd> svd_;
   /** U^T Dt_ V */
   Eigen::MatrixXd Dh_;
+
+  Eigen::VectorXd eval_;
+  Eigen::VectorXd speed_;
+  Eigen::VectorXd normalAcc_;
+  Eigen::MatrixXd jacMat_;
+};
+
+/** Manipulability ellipsoids supported by ManipulabilityEllipsoidTask */
+enum class ManipulabilityEllipsoidType
+{
+  /** Velocity manipulability ellipsoid \f$ M = \tilde{J}\tilde{J}^T \f$ */
+  Velocity
+};
+
+/** Errors between the manipulability ellipsoid M and its target \f$ \hat{M} \f$ */
+enum class ManipulabilityEllipsoidError
+{
+  /** Logarithmic map \f$ \mathrm{Log}_M(\hat{M}) \f$ on the manifold of SPD matrices with the affine-invariant metric
+   * (geometry-aware tracking) */
+  GeometryAware,
+  /** Euclidean difference \f$ \hat{M} - M \f$, which ignores that ellipsoids are SPD matrices */
+  Euclidean
+};
+
+/** Manipulability ellipsoid of a frame, a symmetric positive definite (SPD) matrix \f$ M(q) \f$, tracked towards a
+ * target ellipsoid \f$ \hat{M} \f$ (Jaquier et al., "Geometry-aware manipulability learning, tracking, and transfer",
+ * IJRR 2021).
+ *
+ * The ellipsoid is computed on
+ * \f[ \tilde{J} = P R J_f S \Theta \f]
+ * where:
+ * - \f$ J_f \f$ is the Jacobian of the frame in frame coordinates, and \f$ R \f$ rotates its rows to world axes: the
+ *   rows of \f$ R J_f \f$ are the angular and linear velocities of the frame origin in world coordinates
+ * - \f$ P \f$ selects the world axes and \f$ S \f$ the columns of the measure joints
+ * - \f$ \Theta = \mathrm{diag}(\dot{\theta}_0) \f$ scales the columns by the maximum joint velocities (identity by
+ *   default)
+ *
+ * For the velocity ellipsoid, \f$ M = \tilde{J}\tilde{J}^T \f$ is a D x D matrix, D the number of selected axes.
+ *
+ * The task works on the Mandel vectorization vec() of symmetric matrices (see tasks::spd::vec): eval() is
+ * \f$ \mathrm{vec}(\mathrm{Log}_M(\hat{M})) \f$ (or \f$ \mathrm{vec}(\hat{M} - M) \f$ with the Euclidean error),
+ * speed() is \f$ \mathrm{vec}(\dot{M}) \f$, normalAcc() is \f$ \mathrm{vec}(\ddot{M}) \f$ at zero joint acceleration
+ * and jac() is \f$ \partial \mathrm{vec}(M) / \partial q \f$, defined for every joint of the robot. In a trajectory
+ * task this gives the acceleration-based tracking controller of Jaquier et al. (eqs. 46 and 47).
+ */
+class TASKS_DLLAPI ManipulabilityEllipsoidTask
+{
+public:
+  /**
+   * @param mb Robot
+   * @param bodyName Body the frame is attached to
+   * @param X_b_f Frame pose in body coordinates
+   * @param measureJoints Joints whose Jacobian columns define the ellipsoid. If empty, every joint between the root and
+   * the body, excluding a free root joint (floating base)
+   * @param axes World axes of the ellipsoid, ordered as sva::MotionVecd (rotation then translation). A non-zero entry
+   * selects the axis. Translation by default
+   * @param type Manipulability ellipsoid
+   * @throw std::domain_error if a measure joint is not between the root and the body, appears twice or has no degree of
+   * freedom, or if more axes are selected than measure joints degrees of freedom
+   */
+  ManipulabilityEllipsoidTask(const rbd::MultiBody & mb,
+                              const std::string & bodyName,
+                              const sva::PTransformd & X_b_f = sva::PTransformd::Identity(),
+                              const std::vector<std::string> & measureJoints = {},
+                              const Eigen::Vector6d & axes = (Eigen::Vector6d() << 0., 0., 0., 1., 1., 1.).finished(),
+                              ManipulabilityEllipsoidType type = ManipulabilityEllipsoidType::Velocity);
+
+  void update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc);
+
+  /** Set the target ellipsoid \f$ \hat{M} \f$ (identity at construction)
+   *
+   * @throw std::domain_error if the target is not a size() x size() symmetric positive definite matrix
+   */
+  void target(const Eigen::MatrixXd & target);
+  const Eigen::MatrixXd & target() const;
+
+  /** Ellipsoid computed by the last call to update */
+  const Eigen::MatrixXd & ellipsoid() const;
+
+  /** Affine-invariant distance between the ellipsoid and the target, computed by the last call to update (whatever the
+   * error) */
+  double distance() const;
+
+  void error(ManipulabilityEllipsoidError error);
+  ManipulabilityEllipsoidError error() const;
+
+  /** Set the maximum velocity \f$ \dot{\theta}_0 \f$ of each measure joint degree of freedom, ordered as
+   * measureJoints()
+   *
+   * @throw std::domain_error if the size is not measureDof() or an entry is not strictly positive
+   */
+  void maxJointVelocity(const Eigen::VectorXd & velocity);
+  const Eigen::VectorXd & maxJointVelocity() const;
+
+  ManipulabilityEllipsoidType type() const;
+  const Eigen::Vector6d & axes() const;
+  /** Measure joints, ordered from the root to the body */
+  const std::vector<std::string> & measureJoints() const;
+  /** Number of degrees of freedom of the measure joints */
+  int measureDof() const;
+  /** Size D of the ellipsoid matrix, the number of selected axes */
+  int size() const;
+
+  const Eigen::VectorXd & eval() const;
+  const Eigen::VectorXd & speed() const;
+  const Eigen::VectorXd & normalAcc() const;
+
+  const Eigen::MatrixXd & jac() const;
+
+private:
+  FrameJacobianDerivatives frameJac_;
+  ManipulabilityEllipsoidType type_;
+  ManipulabilityEllipsoidError error_;
+  Eigen::VectorXd maxJointVelocity_;
+
+  Eigen::MatrixXd target_;
+  Eigen::MatrixXd M_;
+  double distance_;
+
+  /** Measure columns of the frame Jacobian, scaled, and their time derivatives in frame coordinates */
+  Eigen::MatrixXd Jh_;
+  Eigen::MatrixXd JhDot_;
+  Eigen::MatrixXd JhDDot_;
+  /** Ellipsoid Jacobian \f$ \tilde{J} \f$ and its time derivatives */
+  Eigen::MatrixXd Jt_;
+  Eigen::MatrixXd JtDot_;
+  Eigen::MatrixXd JtDDot_;
+  /** Partial derivative of \f$ \tilde{J} \f$ with respect to one degree of freedom, in frame then in world coordinates
+   */
+  Eigen::MatrixXd A_;
+  Eigen::MatrixXd At_;
+  /** Jacobian of vec(M) with respect to the path degrees of freedom */
+  Eigen::MatrixXd pathJac_;
 
   Eigen::VectorXd eval_;
   Eigen::VectorXd speed_;

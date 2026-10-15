@@ -4,6 +4,7 @@
 
 // associated header
 #include "Tasks/Tasks.h"
+#include "Tasks/SPDManifold.h"
 
 // includes
 // std
@@ -1357,26 +1358,34 @@ const Eigen::MatrixXd & VectorOrientationTask::jac() const
 { return jacMat_; }
 
 /**
- *													ManipulabilityTask
+ *													FrameJacobianDerivatives
  */
 
-ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
-                                       const std::string & bodyName,
-                                       const sva::PTransformd & X_b_f,
-                                       const std::vector<std::string> & measureJoints,
-                                       const Eigen::Vector6d & axes,
-                                       ManipulabilityMeasure measure)
-: bodyIndex_(mb.sBodyIndexByName(bodyName)), X_b_f_(X_b_f), jac_(mb, bodyName), measure_(measure), axes_(axes),
-  maxTaskVelocity_(Eigen::Vector6d::Ones()), target_(0.), w_(0.), eval_(1), speed_(1), normalAcc_(1),
-  jacMat_(1, mb.nrDof())
+namespace
+{
+
+Eigen::Vector6d motionCross(const Eigen::Vector6d & a, const Eigen::Vector6d & b)
+{ return (sva::MotionVecd(a).cross(sva::MotionVecd(b))).vector(); }
+
+} // namespace
+
+FrameJacobianDerivatives::FrameJacobianDerivatives(const rbd::MultiBody & mb,
+                                                   const std::string & bodyName,
+                                                   const sva::PTransformd & X_b_f,
+                                                   const std::vector<std::string> & measureJoints,
+                                                   const Eigen::Vector6d & axes,
+                                                   const std::string & owner)
+: bodyIndex_(mb.sBodyIndexByName(bodyName)), X_b_f_(X_b_f), jac_(mb, bodyName), axes_(axes)
 {
   const std::vector<int> & path = jac_.jointsPath();
   int col = 0;
-  for(int j : path)
+  for(std::size_t i = 0; i < path.size(); ++i)
   {
-    pathDof_.push_back(mb.joint(j).dof());
-    pathCol_.push_back(col);
-    col += mb.joint(j).dof();
+    const int dof = mb.joint(path[i]).dof();
+    jointDof_.push_back(dof);
+    jointCol_.push_back(col);
+    for(int d = 0; d < dof; ++d) { colJoint_.push_back(static_cast<int>(i)); }
+    col += dof;
   }
 
   // Path indices of the measure joints, in path order
@@ -1398,20 +1407,20 @@ ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
       if(it == path.end())
       {
         std::ostringstream str;
-        str << "ManipulabilityTask: joint " << name << " is not between the root and body " << bodyName;
+        str << owner << ": joint " << name << " is not between the root and body " << bodyName;
         throw std::domain_error(str.str());
       }
       auto i = static_cast<std::size_t>(std::distance(path.begin(), it));
-      if(pathDof_[i] == 0)
+      if(jointDof_[i] == 0)
       {
         std::ostringstream str;
-        str << "ManipulabilityTask: joint " << name << " has no degree of freedom";
+        str << owner << ": joint " << name << " has no degree of freedom";
         throw std::domain_error(str.str());
       }
       if(std::find(measurePath.begin(), measurePath.end(), i) != measurePath.end())
       {
         std::ostringstream str;
-        str << "ManipulabilityTask: joint " << name << " is given twice";
+        str << owner << ": joint " << name << " is given twice";
         throw std::domain_error(str.str());
       }
       measurePath.push_back(i);
@@ -1421,7 +1430,7 @@ ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
   for(std::size_t i : measurePath)
   {
     measureJoints_.push_back(mb.joint(path[i]).name());
-    for(int d = 0; d < pathDof_[i]; ++d) { cols_.push_back(pathCol_[i] + d); }
+    for(int d = 0; d < jointDof_[i]; ++d) { cols_.push_back(jointCol_[i] + d); }
   }
   for(int r = 0; r < 6; ++r)
   {
@@ -1430,19 +1439,73 @@ ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
   if(rows_.empty() || rows_.size() > cols_.size())
   {
     std::ostringstream str;
-    str << "ManipulabilityTask: " << rows_.size() << " axes are selected but the measure joints have " << cols_.size()
+    str << owner << ": " << rows_.size() << " axes are selected but the measure joints have " << cols_.size()
         << " degrees of freedom, select between 1 and " << cols_.size() << " axes";
     throw std::domain_error(str.str());
   }
 
-  const auto nRows = static_cast<Eigen::Index>(rows_.size());
-  const auto nCols = static_cast<Eigen::Index>(cols_.size());
+  J_.setZero(6, col);
+  jacDot_.setZero(6, col);
+  jacDDot_.setZero(6, col);
+  alpha_.setZero(col);
+}
+
+void FrameJacobianDerivatives::update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc)
+{
+  const std::vector<int> & path = jac_.jointsPath();
+  X_0_f_ = X_b_f_ * mbc.bodyPosW[bodyIndex_];
+  // Frame Jacobian in frame coordinates, columns ordered as the path
+  J_ = jac_.jacobian(mb, mbc, X_0_f_);
+
+  for(std::size_t i = 0; i < path.size(); ++i)
+  {
+    for(int d = 0; d < jointDof_[i]; ++d) { alpha_(jointCol_[i] + d) = mbc.alpha[path[i]][d]; }
+  }
+
+  // Jdot_i = J_i x W_i and Jddot_i = Jdot_i x W_i + J_i x Wdot_i (with zero joint accelerations), where
+  // W_i = sum_{k after i} J_k alpha_k is the frame velocity relative to the body of joint i.
+  Eigen::Vector6d W = Eigen::Vector6d::Zero();
+  Eigen::Vector6d WDot = Eigen::Vector6d::Zero();
+  for(auto i = path.size(); i-- > 0;)
+  {
+    for(int c = jointCol_[i]; c < jointCol_[i] + jointDof_[i]; ++c)
+    {
+      jacDot_.col(c) = motionCross(J_.col(c), W);
+      jacDDot_.col(c) = motionCross(jacDot_.col(c), W) + motionCross(J_.col(c), WDot);
+    }
+    for(int c = jointCol_[i]; c < jointCol_[i] + jointDof_[i]; ++c)
+    {
+      W += J_.col(c) * alpha_(c);
+      WDot += jacDot_.col(c) * alpha_(c);
+    }
+  }
+}
+
+void FrameJacobianDerivatives::fullJacobian(const rbd::MultiBody & mb,
+                                            const Eigen::MatrixXd & pathMat,
+                                            Eigen::MatrixXd & fullMat) const
+{ jac_.fullJacobian(mb, pathMat, fullMat); }
+
+/**
+ *													ManipulabilityTask
+ */
+
+ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
+                                       const std::string & bodyName,
+                                       const sva::PTransformd & X_b_f,
+                                       const std::vector<std::string> & measureJoints,
+                                       const Eigen::Vector6d & axes,
+                                       ManipulabilityMeasure measure)
+: frameJac_(mb, bodyName, X_b_f, measureJoints, axes, "ManipulabilityTask"), measure_(measure),
+  maxTaskVelocity_(Eigen::Vector6d::Ones()), target_(0.), w_(0.), eval_(1), speed_(1), normalAcc_(1),
+  jacMat_(1, mb.nrDof())
+{
+  const auto nRows = static_cast<Eigen::Index>(frameJac_.rows().size());
+  const auto nCols = static_cast<Eigen::Index>(frameJac_.cols().size());
+  const auto nPath = frameJac_.jacobian().cols();
   maxJointVelocity_.setOnes(nCols);
-  alpha_.resize(col);
-  jacDot_.resize(6, col);
-  jacDDot_.resize(6, col);
-  G_.resize(6, col);
-  grad_.resize(1, col);
+  G_.resize(6, nPath);
+  grad_.resize(1, nPath);
   Jt_.resize(nRows, nCols);
   Dt_.resize(nRows, nCols);
   Gt_.resize(nRows, nCols);
@@ -1452,44 +1515,19 @@ ManipulabilityTask::ManipulabilityTask(const rbd::MultiBody & mb,
 
 void ManipulabilityTask::update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc)
 {
-  const std::vector<int> & path = jac_.jointsPath();
-  // Frame Jacobian in frame coordinates, columns ordered as the path
-  const Eigen::MatrixXd & J = jac_.jacobian(mb, mbc, X_b_f_ * mbc.bodyPosW[bodyIndex_]);
+  frameJac_.update(mb, mbc);
+  const Eigen::MatrixXd & J = frameJac_.jacobian();
+  const Eigen::MatrixXd & jacDot = frameJac_.jacobianDot();
+  const std::vector<int> & rows = frameJac_.rows();
+  const std::vector<int> & cols = frameJac_.cols();
 
-  for(std::size_t i = 0; i < path.size(); ++i)
+  for(std::size_t r = 0; r < rows.size(); ++r)
   {
-    for(int d = 0; d < pathDof_[i]; ++d) { alpha_(pathCol_[i] + d) = mbc.alpha[path[i]][d]; }
-  }
-
-  auto cross = [](const Eigen::Vector6d & a, const Eigen::Vector6d & b) -> Eigen::Vector6d
-  { return (sva::MotionVecd(a).cross(sva::MotionVecd(b))).vector(); };
-
-  // Column i of the frame Jacobian only depends on the joints after its own joint (dJ_i/dq_k = J_i x J_k), so
-  // Jdot_i = J_i x W_i and Jddot_i = Jdot_i x W_i + J_i x Wdot_i (with zero joint accelerations), where
-  // W_i = sum_{k after i} J_k alpha_k is the frame velocity relative to the body of joint i.
-  Eigen::Vector6d W = Eigen::Vector6d::Zero();
-  Eigen::Vector6d WDot = Eigen::Vector6d::Zero();
-  for(auto i = path.size(); i-- > 0;)
-  {
-    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    for(std::size_t c = 0; c < cols.size(); ++c)
     {
-      jacDot_.col(c) = cross(J.col(c), W);
-      jacDDot_.col(c) = cross(jacDot_.col(c), W) + cross(J.col(c), WDot);
-    }
-    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
-    {
-      W += J.col(c) * alpha_(c);
-      WDot += jacDot_.col(c) * alpha_(c);
-    }
-  }
-
-  for(std::size_t r = 0; r < rows_.size(); ++r)
-  {
-    for(std::size_t c = 0; c < cols_.size(); ++c)
-    {
-      double scale = maxJointVelocity_(static_cast<Eigen::Index>(c)) / maxTaskVelocity_(rows_[r]);
-      Jt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = scale * J(rows_[r], cols_[c]);
-      Dt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = scale * jacDot_(rows_[r], cols_[c]);
+      double scale = maxJointVelocity_(static_cast<Eigen::Index>(c)) / maxTaskVelocity_(rows[r]);
+      Jt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = scale * J(rows[r], cols[c]);
+      Dt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) = scale * jacDot(rows[r], cols[c]);
     }
   }
   svd_.compute(Jt_);
@@ -1504,25 +1542,27 @@ void ManipulabilityTask::update(const rbd::MultiBody & mb, const rbd::MultiBodyC
 
   // Gradient of w with respect to the frame Jacobian
   G_.setZero();
-  for(std::size_t r = 0; r < rows_.size(); ++r)
+  for(std::size_t r = 0; r < rows.size(); ++r)
   {
-    for(std::size_t c = 0; c < cols_.size(); ++c)
+    for(std::size_t c = 0; c < cols.size(); ++c)
     {
-      double scale = maxJointVelocity_(static_cast<Eigen::Index>(c)) / maxTaskVelocity_(rows_[r]);
-      G_(rows_[r], cols_[c]) = scale * Gt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c));
+      double scale = maxJointVelocity_(static_cast<Eigen::Index>(c)) / maxTaskVelocity_(rows[r]);
+      G_(rows[r], cols[c]) = scale * Gt_(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c));
     }
   }
 
   // dw/dq_k = sum_{i before k} <G_i, J_i x J_k>, evaluated with prefix sums over the path
+  const std::vector<int> & jointDof = frameJac_.jointDof();
+  const std::vector<int> & jointCol = frameJac_.jointCol();
   Eigen::Vector3d A = Eigen::Vector3d::Zero();
   Eigen::Vector3d B = Eigen::Vector3d::Zero();
-  for(std::size_t i = 0; i < path.size(); ++i)
+  for(std::size_t i = 0; i < jointDof.size(); ++i)
   {
-    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    for(int c = jointCol[i]; c < jointCol[i] + jointDof[i]; ++c)
     {
       grad_(0, c) = J.col(c).head<3>().dot(A) + J.col(c).tail<3>().dot(B);
     }
-    for(int c = pathCol_[i]; c < pathCol_[i] + pathDof_[i]; ++c)
+    for(int c = jointCol[i]; c < jointCol[i] + jointDof[i]; ++c)
     {
       A += G_.col(c).head<3>().cross(J.col(c).head<3>()) + G_.col(c).tail<3>().cross(J.col(c).tail<3>());
       B += G_.col(c).tail<3>().cross(J.col(c).head<3>());
@@ -1530,9 +1570,9 @@ void ManipulabilityTask::update(const rbd::MultiBody & mb, const rbd::MultiBodyC
   }
 
   eval_(0) = target_ - w_;
-  speed_(0) = grad_.row(0).dot(alpha_);
-  normalAcc_(0) = d2w + G_.cwiseProduct(jacDDot_).sum();
-  jac_.fullJacobian(mb, grad_, jacMat_);
+  speed_(0) = grad_.row(0).dot(frameJac_.alpha());
+  normalAcc_(0) = d2w + G_.cwiseProduct(frameJac_.jacobianDDot()).sum();
+  frameJac_.fullJacobian(mb, grad_, jacMat_);
 }
 
 double ManipulabilityTask::computeYoshikawa()
@@ -1594,7 +1634,7 @@ double ManipulabilityTask::manipulability() const
 
 void ManipulabilityTask::maxTaskVelocity(const Eigen::Vector6d & velocity)
 {
-  for(int r : rows_)
+  for(int r : frameJac_.rows())
   {
     if(!(velocity(r) > 0.)) { throw std::domain_error("ManipulabilityTask: maximum task velocities must be positive"); }
   }
@@ -1627,13 +1667,13 @@ ManipulabilityMeasure ManipulabilityTask::measure() const
 { return measure_; }
 
 const Eigen::Vector6d & ManipulabilityTask::axes() const
-{ return axes_; }
+{ return frameJac_.axes(); }
 
 const std::vector<std::string> & ManipulabilityTask::measureJoints() const
-{ return measureJoints_; }
+{ return frameJac_.measureJoints(); }
 
 int ManipulabilityTask::measureDof() const
-{ return static_cast<int>(cols_.size()); }
+{ return static_cast<int>(frameJac_.cols().size()); }
 
 const Eigen::VectorXd & ManipulabilityTask::eval() const
 { return eval_; }
@@ -1645,6 +1685,218 @@ const Eigen::VectorXd & ManipulabilityTask::normalAcc() const
 { return normalAcc_; }
 
 const Eigen::MatrixXd & ManipulabilityTask::jac() const
+{ return jacMat_; }
+
+/**
+ *													ManipulabilityEllipsoidTask
+ */
+
+namespace
+{
+
+/** [w]x applied to the angular rows and to the linear rows of X (6 rows) */
+Eigen::MatrixXd crossBlocks(const Eigen::Vector3d & w, const Eigen::MatrixXd & X)
+{
+  const Eigen::Matrix3d W = sva::vector3ToCrossMatrix(w);
+  Eigen::MatrixXd res(6, X.cols());
+  res.topRows<3>().noalias() = W * X.topRows<3>();
+  res.bottomRows<3>().noalias() = W * X.bottomRows<3>();
+  return res;
+}
+
+/** Selected rows of blockdiag(R, R) X (6 rows) */
+void rotateRows(const Eigen::Matrix3d & R,
+                const std::vector<int> & rows,
+                const Eigen::MatrixXd & X,
+                Eigen::MatrixXd & res)
+{
+  for(std::size_t i = 0; i < rows.size(); ++i)
+  {
+    const auto r = static_cast<Eigen::Index>(i);
+    if(rows[i] < 3) { res.row(r).noalias() = R.row(rows[i]) * X.topRows<3>(); }
+    else
+    {
+      res.row(r).noalias() = R.row(rows[i] - 3) * X.bottomRows<3>();
+    }
+  }
+}
+
+} // namespace
+
+ManipulabilityEllipsoidTask::ManipulabilityEllipsoidTask(const rbd::MultiBody & mb,
+                                                         const std::string & bodyName,
+                                                         const sva::PTransformd & X_b_f,
+                                                         const std::vector<std::string> & measureJoints,
+                                                         const Eigen::Vector6d & axes,
+                                                         ManipulabilityEllipsoidType type)
+: frameJac_(mb, bodyName, X_b_f, measureJoints, axes, "ManipulabilityEllipsoidTask"), type_(type),
+  error_(ManipulabilityEllipsoidError::GeometryAware), distance_(0.)
+{
+  const auto D = static_cast<Eigen::Index>(frameJac_.rows().size());
+  const auto m = static_cast<Eigen::Index>(frameJac_.cols().size());
+  const auto nPath = frameJac_.jacobian().cols();
+  const auto dim = static_cast<Eigen::Index>(spd::vecSize(static_cast<int>(D)));
+  maxJointVelocity_.setOnes(m);
+  target_.setIdentity(D, D);
+  M_.setZero(D, D);
+  Jh_.resize(6, m);
+  JhDot_.resize(6, m);
+  JhDDot_.resize(6, m);
+  Jt_.resize(D, m);
+  JtDot_.resize(D, m);
+  JtDDot_.resize(D, m);
+  A_.resize(6, m);
+  At_.resize(D, m);
+  pathJac_.setZero(dim, nPath);
+  eval_.setZero(dim);
+  speed_.setZero(dim);
+  normalAcc_.setZero(dim);
+  jacMat_.setZero(dim, mb.nrDof());
+}
+
+void ManipulabilityEllipsoidTask::update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc)
+{
+  frameJac_.update(mb, mbc);
+  const Eigen::MatrixXd & J = frameJac_.jacobian();
+  const Eigen::MatrixXd & jacDot = frameJac_.jacobianDot();
+  const Eigen::MatrixXd & jacDDot = frameJac_.jacobianDDot();
+  const Eigen::VectorXd & alpha = frameJac_.alpha();
+  const std::vector<int> & rows = frameJac_.rows();
+  const std::vector<int> & cols = frameJac_.cols();
+  const std::vector<int> & colJoint = frameJac_.colJoint();
+
+  // Frame to world rotation, angular velocity of the frame and its derivative at zero joint acceleration, in frame
+  // coordinates
+  const Eigen::Matrix3d R = frameJac_.X_0_f().rotation().transpose();
+  const Eigen::Vector3d w = J.topRows<3>() * alpha;
+  const Eigen::Vector3d wDot = jacDot.topRows<3>() * alpha;
+
+  for(std::size_t c = 0; c < cols.size(); ++c)
+  {
+    const auto i = static_cast<Eigen::Index>(c);
+    Jh_.col(i) = maxJointVelocity_(i) * J.col(cols[c]);
+    JhDot_.col(i) = maxJointVelocity_(i) * jacDot.col(cols[c]);
+    JhDDot_.col(i) = maxJointVelocity_(i) * jacDDot.col(cols[c]);
+  }
+
+  // Jt = P R Jh with R = blockdiag(R, R) and dR/dt = R [w]x, so
+  // dJt/dt = P R ([w]x Jh + dJh/dt) and d2Jt/dt2 = P R (([w]x^2 + [dw/dt]x) Jh + 2 [w]x dJh/dt + d2Jh/dt2)
+  const Eigen::MatrixXd wJh = crossBlocks(w, Jh_);
+  rotateRows(R, rows, Jh_, Jt_);
+  rotateRows(R, rows, wJh + JhDot_, JtDot_);
+  rotateRows(R, rows, crossBlocks(w, wJh) + crossBlocks(wDot, Jh_) + 2. * crossBlocks(w, JhDot_) + JhDDot_, JtDDot_);
+
+  M_.noalias() = Jt_ * Jt_.transpose();
+  const Eigen::MatrixXd X = JtDot_ * Jt_.transpose();
+  const Eigen::MatrixXd Y = JtDDot_ * Jt_.transpose();
+  const Eigen::MatrixXd MDot = X + X.transpose();
+  const Eigen::MatrixXd MDDot = Y + Y.transpose() + 2. * JtDot_ * JtDot_.transpose();
+
+  // dJt/dq_k = P R ([w_k]x Jh + dJh/dq_k), w_k the angular part of J_k, and dJh_c/dq_k = J_c x J_k (scaled) when the
+  // joint of k is after the joint of c
+  for(Eigen::Index k = 0; k < J.cols(); ++k)
+  {
+    const Eigen::Vector3d wk = J.col(k).head<3>();
+    A_ = crossBlocks(wk, Jh_);
+    for(std::size_t c = 0; c < cols.size(); ++c)
+    {
+      if(colJoint[static_cast<std::size_t>(k)] > colJoint[static_cast<std::size_t>(cols[c])])
+      {
+        const auto i = static_cast<Eigen::Index>(c);
+        A_.col(i) += maxJointVelocity_(i) * motionCross(J.col(cols[c]), J.col(k));
+      }
+    }
+    rotateRows(R, rows, A_, At_);
+    const Eigen::MatrixXd dM = At_ * Jt_.transpose();
+    pathJac_.col(k) = spd::vec(dM + dM.transpose());
+  }
+  frameJac_.fullJacobian(mb, pathJac_, jacMat_);
+
+  switch(error_)
+  {
+    case ManipulabilityEllipsoidError::GeometryAware:
+      eval_ = spd::vec(spd::log(M_, target_, &distance_));
+      break;
+    case ManipulabilityEllipsoidError::Euclidean:
+      eval_ = spd::vec(target_ - M_);
+      distance_ = spd::distance(M_, target_);
+      break;
+  }
+  speed_ = spd::vec(MDot);
+  normalAcc_ = spd::vec(MDDot);
+}
+
+void ManipulabilityEllipsoidTask::target(const Eigen::MatrixXd & target)
+{
+  if(target.rows() != size() || target.cols() != size() || !spd::isSPD(target))
+  {
+    std::ostringstream str;
+    str << "ManipulabilityEllipsoidTask: the target must be a " << size() << "x" << size()
+        << " symmetric positive definite matrix";
+    throw std::domain_error(str.str());
+  }
+  target_ = 0.5 * (target + target.transpose());
+}
+
+const Eigen::MatrixXd & ManipulabilityEllipsoidTask::target() const
+{ return target_; }
+
+const Eigen::MatrixXd & ManipulabilityEllipsoidTask::ellipsoid() const
+{ return M_; }
+
+double ManipulabilityEllipsoidTask::distance() const
+{ return distance_; }
+
+void ManipulabilityEllipsoidTask::error(ManipulabilityEllipsoidError error)
+{ error_ = error; }
+
+ManipulabilityEllipsoidError ManipulabilityEllipsoidTask::error() const
+{ return error_; }
+
+void ManipulabilityEllipsoidTask::maxJointVelocity(const Eigen::VectorXd & velocity)
+{
+  if(velocity.size() != maxJointVelocity_.size())
+  {
+    std::ostringstream str;
+    str << "ManipulabilityEllipsoidTask: " << velocity.size() << " maximum joint velocities given, expected "
+        << maxJointVelocity_.size();
+    throw std::domain_error(str.str());
+  }
+  if(!(velocity.array() > 0.).all())
+  {
+    throw std::domain_error("ManipulabilityEllipsoidTask: maximum joint velocities must be positive");
+  }
+  maxJointVelocity_ = velocity;
+}
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::maxJointVelocity() const
+{ return maxJointVelocity_; }
+
+ManipulabilityEllipsoidType ManipulabilityEllipsoidTask::type() const
+{ return type_; }
+
+const Eigen::Vector6d & ManipulabilityEllipsoidTask::axes() const
+{ return frameJac_.axes(); }
+
+const std::vector<std::string> & ManipulabilityEllipsoidTask::measureJoints() const
+{ return frameJac_.measureJoints(); }
+
+int ManipulabilityEllipsoidTask::measureDof() const
+{ return static_cast<int>(frameJac_.cols().size()); }
+
+int ManipulabilityEllipsoidTask::size() const
+{ return static_cast<int>(frameJac_.rows().size()); }
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::eval() const
+{ return eval_; }
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::speed() const
+{ return speed_; }
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::normalAcc() const
+{ return normalAcc_; }
+
+const Eigen::MatrixXd & ManipulabilityEllipsoidTask::jac() const
 { return jacMat_; }
 
 } // namespace tasks

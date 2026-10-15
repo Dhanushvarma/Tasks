@@ -1152,6 +1152,40 @@ private:
   int robotIndex_;
 };
 
+class TASKS_DLLAPI ManipulabilityEllipsoidTask : public HighLevelTask
+{
+public:
+  /** See tasks::ManipulabilityEllipsoidTask */
+  ManipulabilityEllipsoidTask(const std::vector<rbd::MultiBody> & mbs,
+                              int robotIndex,
+                              const std::string & bodyName,
+                              const sva::PTransformd & X_b_f = sva::PTransformd::Identity(),
+                              const std::vector<std::string> & measureJoints = {},
+                              const Eigen::Vector6d & axes = (Eigen::Vector6d() << 0., 0., 0., 1., 1., 1.).finished(),
+                              ManipulabilityEllipsoidType type = ManipulabilityEllipsoidType::Velocity);
+
+  tasks::ManipulabilityEllipsoidTask & task() { return met_; }
+
+  void target(const Eigen::MatrixXd & target) { met_.target(target); }
+  const Eigen::MatrixXd & target() const { return met_.target(); }
+  const Eigen::MatrixXd & ellipsoid() const { return met_.ellipsoid(); }
+  double distance() const { return met_.distance(); }
+
+  virtual int dim() override;
+  virtual void update(const std::vector<rbd::MultiBody> & mbs,
+                      const std::vector<rbd::MultiBodyConfig> & mbcs,
+                      const SolverData & data) override;
+
+  virtual const Eigen::MatrixXd & jac() const override;
+  virtual const Eigen::VectorXd & eval() const override;
+  virtual const Eigen::VectorXd & speed() const override;
+  virtual const Eigen::VectorXd & normalAcc() const override;
+
+private:
+  tasks::ManipulabilityEllipsoidTask met_;
+  int robotIndex_;
+};
+
 } // namespace qp
 
 } // namespace tasks

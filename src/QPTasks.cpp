@@ -1564,6 +1564,41 @@ const Eigen::VectorXd & ManipulabilityTask::speed() const
 const Eigen::VectorXd & ManipulabilityTask::normalAcc() const
 { return mt_.normalAcc(); }
 
+/**
+ *											ManipulabilityEllipsoidTask
+ */
+
+ManipulabilityEllipsoidTask::ManipulabilityEllipsoidTask(const std::vector<rbd::MultiBody> & mbs,
+                                                         int rI,
+                                                         const std::string & bodyName,
+                                                         const sva::PTransformd & X_b_f,
+                                                         const std::vector<std::string> & measureJoints,
+                                                         const Eigen::Vector6d & axes,
+                                                         ManipulabilityEllipsoidType type)
+: met_(mbs[rI], bodyName, X_b_f, measureJoints, axes, type), robotIndex_(rI)
+{
+}
+
+int ManipulabilityEllipsoidTask::dim()
+{ return static_cast<int>(met_.eval().size()); }
+
+void ManipulabilityEllipsoidTask::update(const std::vector<rbd::MultiBody> & mbs,
+                                         const std::vector<rbd::MultiBodyConfig> & mbcs,
+                                         const SolverData & /* data */)
+{ met_.update(mbs[robotIndex_], mbcs[robotIndex_]); }
+
+const Eigen::MatrixXd & ManipulabilityEllipsoidTask::jac() const
+{ return met_.jac(); }
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::eval() const
+{ return met_.eval(); }
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::speed() const
+{ return met_.speed(); }
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::normalAcc() const
+{ return met_.normalAcc(); }
+
 } // namespace qp
 
 } // namespace tasks

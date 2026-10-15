@@ -1782,3 +1782,56 @@ BOOST_AUTO_TEST_CASE(QPManipulabilityTaskTest)
   BOOST_CHECK_SMALL(manipTask.eval().norm(), 1e-4);
   BOOST_CHECK_SMALL(manipTask.speed().norm(), 1e-4);
 }
+
+BOOST_AUTO_TEST_CASE(QPManipulabilityEllipsoidTaskTest)
+{
+  using namespace Eigen;
+  using namespace sva;
+  using namespace rbd;
+  using namespace tasks;
+
+  MultiBody mb;
+  MultiBodyConfig mbcInit;
+
+  std::tie(mb, mbcInit) = makeZXZArm();
+  mbcInit.q = {{}, {0.}, {0.3}, {0.4}};
+  forwardKinematics(mb, mbcInit);
+  forwardVelocity(mb, mbcInit);
+
+  std::vector<MultiBody> mbs = {mb};
+  std::vector<MultiBodyConfig> mbcs = {mbcInit};
+
+  qp::QPSolver solver;
+  solver.nrVars(mbs, {}, {});
+  solver.updateConstrSize();
+
+  // Translation ellipsoid of a point beyond the last joint, the target is the ellipsoid of a nearby configuration
+  qp::ManipulabilityEllipsoidTask manipTask(mbs, 0, "b3", PTransformd(Vector3d(0., 0.5, 0.)));
+  BOOST_CHECK_EQUAL(manipTask.dim(), 6);
+  MultiBodyConfig mbcTarget(mbcInit);
+  mbcTarget.q = {{}, {0.2}, {0.15}, {0.65}};
+  forwardKinematics(mb, mbcTarget);
+  forwardVelocity(mb, mbcTarget);
+  manipTask.task().update(mb, mbcTarget);
+  manipTask.target(manipTask.ellipsoid());
+  manipTask.update(mbs, mbcs, solver.data());
+  const double d0 = manipTask.distance();
+
+  qp::SetPointTask manipTaskSp(mbs, 0, &manipTask, 10., 1.);
+  qp::PostureTask postureTask(mbs, 0, mbcInit.q, 0., 1e-3);
+  postureTask.gains(0., 2.);
+  solver.addTask(&manipTaskSp);
+  solver.addTask(&postureTask);
+
+  for(int i = 0; i < 10000; ++i)
+  {
+    BOOST_REQUIRE(solver.solve(mbs, mbcs));
+    integration(mb, mbcs[0], 0.001);
+    forwardKinematics(mb, mbcs[0]);
+    forwardVelocity(mb, mbcs[0]);
+  }
+  manipTask.update(mbs, mbcs, solver.data());
+  BOOST_CHECK_GT(d0, 0.1);
+  BOOST_CHECK_SMALL(manipTask.distance(), 1e-3);
+  BOOST_CHECK_SMALL(manipTask.speed().norm(), 1e-3);
+}
