@@ -945,6 +945,11 @@ BOOST_AUTO_TEST_CASE(ManipulabilityEllipsoidTaskSingularTest)
     BOOST_CHECK(singular.jac().allFinite());
     BOOST_CHECK(singular.speed().allFinite());
     BOOST_CHECK(singular.normalAcc().allFinite());
+    // The target can still be reset to the current, singular, ellipsoid
+    singular.resetTarget();
+    BOOST_CHECK(tasks::spd::isSPD(singular.target()));
+    BOOST_CHECK_SMALL((singular.target() - singular.ellipsoid()).norm(),
+                      1e-5 * std::max(1., singular.ellipsoid().norm()));
   }
 
   // Invalid definitions and targets

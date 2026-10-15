@@ -14,6 +14,9 @@
 #include <sstream>
 #include <stdexcept>
 
+// Eigen
+#include <Eigen/Eigenvalues>
+
 // rbd
 #include <RBDyn/MultiBody.h>
 #include <RBDyn/MultiBodyConfig.h>
@@ -1840,6 +1843,15 @@ void ManipulabilityEllipsoidTask::target(const Eigen::MatrixXd & target)
 
 const Eigen::MatrixXd & ManipulabilityEllipsoidTask::target() const
 { return target_; }
+
+void ManipulabilityEllipsoidTask::resetTarget()
+{
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(M_);
+  const double lMin = std::max(1e-6 * es.eigenvalues().maxCoeff(), 1e-12);
+  const Eigen::MatrixXd & V = es.eigenvectors();
+  target_ = V * es.eigenvalues().cwiseMax(lMin).asDiagonal() * V.transpose();
+  target_ = 0.5 * (target_ + target_.transpose());
+}
 
 const Eigen::MatrixXd & ManipulabilityEllipsoidTask::ellipsoid() const
 { return M_; }

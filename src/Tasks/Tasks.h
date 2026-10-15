@@ -948,6 +948,10 @@ public:
   void target(const Eigen::MatrixXd & target);
   const Eigen::MatrixXd & target() const;
 
+  /** Set the target to the ellipsoid computed by the last call to update. Its eigenvalues are bounded below by 1e-6
+   * times the largest one (and 1e-12), so the target is positive definite at singular configurations */
+  void resetTarget();
+
   /** Ellipsoid computed by the last call to update */
   const Eigen::MatrixXd & ellipsoid() const;
 
