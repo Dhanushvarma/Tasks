@@ -913,10 +913,10 @@ enum class ManipulabilityEllipsoidError
  *   ellipsoid (identity by default)
  *
  * For D selected axes, \f$ N = \tilde{J}\tilde{J}^T \f$ is a D x D matrix. The velocity ellipsoid is \f$ M = N \f$.
- * The force ellipsoid is its inverse (Jaquier et al., eqs. 35 and 52). With the translation axes, it holds the forces
- * at the frame origin, with zero moment, that the measure joints balance with torques
- * \f$ \|\mathrm{diag}(1 / \tau_0) \, \tau\| \le 1 \f$. The axes are selected before the inversion, so this is not a
- * block of the inverse of the 6D N. The force ellipsoid is regularized so that it stays finite at singular
+ * The force ellipsoid is its inverse (Jaquier et al., eq. 35, and Sec. 4.3 for the torque scaling). With the
+ * translation axes, it holds the forces at the frame origin, with zero moment, that the measure joints balance with
+ * torques \f$ \|\mathrm{diag}(1 / \tau_0) \, \tau\| \le 1 \f$. The axes are selected before the inversion, so this is
+ * not a block of the inverse of the 6D N. The force ellipsoid is regularized so that it stays finite at singular
  * configurations, \f$ M = (N + \epsilon I)^{-1} \f$ with \f$ \epsilon = 10^{-6} \, \mathrm{tr}(N) / D \f$, which
  * changes it by a relative 1e-6 times the condition number of N at most.
  *
