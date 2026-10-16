@@ -15,6 +15,7 @@
 #include <stdexcept>
 
 // Eigen
+#include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 
 // rbd
@@ -1724,6 +1725,27 @@ void rotateRows(const Eigen::Matrix3d & R,
   }
 }
 
+/** Add eps I to S, with eps = 1e-6 tr(S) / D: the regularization of the force ellipsoid, applied to N and to its
+ * derivatives */
+void regularizeForce(Eigen::MatrixXd & S)
+{ S.diagonal().array() += 1e-6 * S.trace() / static_cast<double>(S.rows()); }
+
+/** Throw if the maximum joint velocities or torques do not have size entries, or if one is not strictly positive and
+ * finite */
+void checkMaxJoint(const Eigen::VectorXd & values, Eigen::Index size, const std::string & what)
+{
+  if(values.size() != size)
+  {
+    std::ostringstream str;
+    str << "ManipulabilityEllipsoidTask: " << values.size() << " maximum joint " << what << " given, expected " << size;
+    throw std::domain_error(str.str());
+  }
+  if(!(values.array() > 0.).all() || !values.allFinite())
+  {
+    throw std::domain_error("ManipulabilityEllipsoidTask: maximum joint " + what + " must be positive and finite");
+  }
+}
+
 } // namespace
 
 ManipulabilityEllipsoidTask::ManipulabilityEllipsoidTask(const rbd::MultiBody & mb,
@@ -1740,6 +1762,8 @@ ManipulabilityEllipsoidTask::ManipulabilityEllipsoidTask(const rbd::MultiBody & 
   const auto nPath = frameJac_.jacobian().cols();
   const auto dim = static_cast<Eigen::Index>(spd::vecSize(static_cast<int>(D)));
   maxJointVelocity_.setOnes(m);
+  maxJointTorque_.setOnes(m);
+  scale_.setOnes(m);
   target_.setIdentity(D, D);
   M_.setZero(D, D);
   Jh_.resize(6, m);
@@ -1777,9 +1801,9 @@ void ManipulabilityEllipsoidTask::update(const rbd::MultiBody & mb, const rbd::M
   for(std::size_t c = 0; c < cols.size(); ++c)
   {
     const auto i = static_cast<Eigen::Index>(c);
-    Jh_.col(i) = maxJointVelocity_(i) * J.col(cols[c]);
-    JhDot_.col(i) = maxJointVelocity_(i) * jacDot.col(cols[c]);
-    JhDDot_.col(i) = maxJointVelocity_(i) * jacDDot.col(cols[c]);
+    Jh_.col(i) = scale_(i) * J.col(cols[c]);
+    JhDot_.col(i) = scale_(i) * jacDot.col(cols[c]);
+    JhDDot_.col(i) = scale_(i) * jacDDot.col(cols[c]);
   }
 
   // Jt = P R Jh with R = blockdiag(R, R) and dR/dt = R [w]x, so
@@ -1789,11 +1813,45 @@ void ManipulabilityEllipsoidTask::update(const rbd::MultiBody & mb, const rbd::M
   rotateRows(R, rows, wJh + JhDot_, JtDot_);
   rotateRows(R, rows, crossBlocks(w, wJh) + crossBlocks(wDot, Jh_) + 2. * crossBlocks(w, JhDot_) + JhDDot_, JtDDot_);
 
-  M_.noalias() = Jt_ * Jt_.transpose();
+  // N = Jt Jt^T and its time derivatives
   const Eigen::MatrixXd X = JtDot_ * Jt_.transpose();
   const Eigen::MatrixXd Y = JtDDot_ * Jt_.transpose();
-  const Eigen::MatrixXd MDot = X + X.transpose();
-  const Eigen::MatrixXd MDDot = Y + Y.transpose() + 2. * JtDot_ * JtDot_.transpose();
+  Eigen::MatrixXd N = Jt_ * Jt_.transpose();
+  Eigen::MatrixXd NDot = X + X.transpose();
+  Eigen::MatrixXd NDDot = Y + Y.transpose() + 2. * JtDot_ * JtDot_.transpose();
+
+  // The force ellipsoid is M = N'^-1 with N' = N + eps I, so dM/dt = -M dN'/dt M and
+  // d2M/dt2 = 2 M dN'/dt M dN'/dt M - M d2N'/dt2 M. eps = 1e-6 tr(N) / D depends on q: each derivative of N' gets the
+  // same trace term as N. N' = I when N is zero (the measure joints cannot move the frame along the selected axes),
+  // which keeps the outputs finite
+  const bool force = type_ == ManipulabilityEllipsoidType::Force;
+  const bool regularize = force && N.trace() > 0.;
+  Eigen::MatrixXd MDot;
+  Eigen::MatrixXd MDDot;
+  if(force)
+  {
+    if(regularize)
+    {
+      regularizeForce(N);
+      regularizeForce(NDot);
+      regularizeForce(NDDot);
+    }
+    else
+    {
+      N.setIdentity();
+    }
+    M_ = N.llt().solve(Eigen::MatrixXd::Identity(N.rows(), N.cols()));
+    M_ = 0.5 * (M_ + M_.transpose()).eval();
+    const Eigen::MatrixXd MNDot = M_ * NDot;
+    MDot = -MNDot * M_;
+    MDDot = 2. * MNDot * MNDot * M_ - M_ * NDDot * M_;
+  }
+  else
+  {
+    M_ = N;
+    MDot = NDot;
+    MDDot = NDDot;
+  }
 
   // dJt/dq_k = P R ([w_k]x Jh + dJh/dq_k), w_k the angular part of J_k, and dJh_c/dq_k = J_c x J_k (scaled) when the
   // joint of k is after the joint of c
@@ -1806,12 +1864,18 @@ void ManipulabilityEllipsoidTask::update(const rbd::MultiBody & mb, const rbd::M
       if(colJoint[static_cast<std::size_t>(k)] > colJoint[static_cast<std::size_t>(cols[c])])
       {
         const auto i = static_cast<Eigen::Index>(c);
-        A_.col(i) += maxJointVelocity_(i) * motionCross(J.col(cols[c]), J.col(k));
+        A_.col(i) += scale_(i) * motionCross(J.col(cols[c]), J.col(k));
       }
     }
     rotateRows(R, rows, A_, At_);
-    const Eigen::MatrixXd dM = At_ * Jt_.transpose();
-    pathJac_.col(k) = spd::vec(dM + dM.transpose());
+    const Eigen::MatrixXd AJt = At_ * Jt_.transpose();
+    Eigen::MatrixXd dM = AJt + AJt.transpose();
+    if(force)
+    {
+      if(regularize) { regularizeForce(dM); }
+      dM = (-M_ * dM * M_).eval();
+    }
+    pathJac_.col(k) = spd::vec(dM);
   }
   frameJac_.fullJacobian(mb, pathJac_, jacMat_);
 
@@ -1838,7 +1902,7 @@ void ManipulabilityEllipsoidTask::target(const Eigen::MatrixXd & target)
         << " symmetric positive definite matrix";
     throw std::domain_error(str.str());
   }
-  target_ = 0.5 * (target + target.transpose());
+  target_ = 0.5 * (target + target.transpose()).eval();
 }
 
 const Eigen::MatrixXd & ManipulabilityEllipsoidTask::target() const
@@ -1850,7 +1914,7 @@ void ManipulabilityEllipsoidTask::resetTarget()
   const double lMin = std::max(1e-6 * es.eigenvalues().maxCoeff(), 1e-12);
   const Eigen::MatrixXd & V = es.eigenvectors();
   target_ = V * es.eigenvalues().cwiseMax(lMin).asDiagonal() * V.transpose();
-  target_ = 0.5 * (target_ + target_.transpose());
+  target_ = 0.5 * (target_ + target_.transpose()).eval();
 }
 
 const Eigen::MatrixXd & ManipulabilityEllipsoidTask::ellipsoid() const
@@ -1867,22 +1931,32 @@ ManipulabilityEllipsoidError ManipulabilityEllipsoidTask::error() const
 
 void ManipulabilityEllipsoidTask::maxJointVelocity(const Eigen::VectorXd & velocity)
 {
-  if(velocity.size() != maxJointVelocity_.size())
+  if(type_ != ManipulabilityEllipsoidType::Velocity)
   {
-    std::ostringstream str;
-    str << "ManipulabilityEllipsoidTask: " << velocity.size() << " maximum joint velocities given, expected "
-        << maxJointVelocity_.size();
-    throw std::domain_error(str.str());
+    throw std::domain_error(
+        "ManipulabilityEllipsoidTask: maximum joint velocities only apply to the velocity ellipsoid");
   }
-  if(!(velocity.array() > 0.).all())
-  {
-    throw std::domain_error("ManipulabilityEllipsoidTask: maximum joint velocities must be positive");
-  }
+  checkMaxJoint(velocity, maxJointVelocity_.size(), "velocities");
   maxJointVelocity_ = velocity;
+  scale_ = velocity;
 }
 
 const Eigen::VectorXd & ManipulabilityEllipsoidTask::maxJointVelocity() const
 { return maxJointVelocity_; }
+
+void ManipulabilityEllipsoidTask::maxJointTorque(const Eigen::VectorXd & torque)
+{
+  if(type_ != ManipulabilityEllipsoidType::Force)
+  {
+    throw std::domain_error("ManipulabilityEllipsoidTask: maximum joint torques only apply to the force ellipsoid");
+  }
+  checkMaxJoint(torque, maxJointTorque_.size(), "torques");
+  maxJointTorque_ = torque;
+  scale_ = torque.cwiseInverse();
+}
+
+const Eigen::VectorXd & ManipulabilityEllipsoidTask::maxJointTorque() const
+{ return maxJointTorque_; }
 
 ManipulabilityEllipsoidType ManipulabilityEllipsoidTask::type() const
 { return type_; }

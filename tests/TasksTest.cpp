@@ -7,6 +7,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <tuple>
 
 // boost
@@ -770,6 +771,12 @@ BOOST_AUTO_TEST_CASE(SPDManifoldTest)
     BOOST_CHECK_SMALL(spd::distance(B, A) - d, 1e-8);
     BOOST_CHECK_SMALL(dLog - d, 1e-8);
 
+    // Inversion keeps distances and maps the logarithm: Log_{A^-1}(B^-1) = -A^-1 Log_A(B) A^-1
+    const MatrixXd Ainv = A.inverse();
+    const MatrixXd LInv = -Ainv * L * Ainv;
+    BOOST_CHECK_SMALL(spd::distance(Ainv, B.inverse()) - d, 1e-8);
+    BOOST_CHECK_SMALL((spd::log(Ainv, B.inverse()) - LInv).norm(), 1e-8 * std::max(1., LInv.norm()));
+
     // Geodesic: end points, initial velocity Log_A(B), constant speed and derivatives
     BOOST_CHECK_SMALL((spd::geodesic(A, B, 0.) - A).norm(), 1e-8);
     BOOST_CHECK_SMALL((spd::geodesic(A, B, 1.) - B).norm(), 1e-8);
@@ -795,14 +802,14 @@ BOOST_AUTO_TEST_CASE(SPDManifoldTest)
   BOOST_CHECK_THROW(spd::unvec(VectorXd::Ones(4)), std::domain_error);
 }
 
-/// Check jac, speed and normalAcc against central differences of the ellipsoid
+/// Check jac, speed and normalAcc against central differences of the ellipsoid, within tol times its norm
 void testEllipsoidNumDiff(const rbd::MultiBody & mb,
                           const rbd::MultiBodyConfig & mbcInit,
                           tasks::ManipulabilityEllipsoidTask & task,
-                          int nrIter = 20)
+                          int nrIter = 20,
+                          double tol = 1e-4)
 {
   const double diffStep = 1e-5;
-  const double tol = 1e-4;
   rbd::MultiBodyConfig mbcCur(mbcInit);
   auto vecM = [&task]() { return tasks::spd::vec(task.ellipsoid()); };
   for(int iter = 0; iter < nrIter; ++iter)
@@ -816,7 +823,7 @@ void testEllipsoidNumDiff(const rbd::MultiBody & mb,
     const Eigen::VectorXd alpha = rbd::dofToVector(mb, mbcCur.alpha);
     const Eigen::VectorXd alphaD = rbd::dofToVector(mb, mbcCur.alphaD);
     const Eigen::VectorXd accCur = task.normalAcc() + jac * alphaD;
-    BOOST_CHECK_SMALL((jac * alpha - speedCur).norm(), 1e-9 * scale);
+    BOOST_CHECK_SMALL((jac * alpha - speedCur).norm(), 1e-9 * std::max(scale, jac.norm() * alpha.norm()));
 
     // Jacobian, moving along each degree of freedom
     rbd::MultiBodyConfig mbcDof(mbcCur);
@@ -920,6 +927,86 @@ BOOST_AUTO_TEST_CASE(ManipulabilityEllipsoidTaskTest)
   BOOST_CHECK_SMALL(task.distance() - spd::distance(M, target), 1e-10);
 }
 
+BOOST_AUTO_TEST_CASE(ManipulabilityForceEllipsoidTaskTest)
+{
+  using namespace Eigen;
+  using namespace rbd;
+  namespace spd = tasks::spd;
+  using Type = tasks::ManipulabilityEllipsoidType;
+
+  MultiBody mb;
+  MultiBodyConfig mbc;
+  const sva::PTransformd X_b_f(sva::RotY(0.4) * sva::RotZ(-0.3), Vector3d(0.1, -0.05, 0.2));
+  Vector6d translation;
+  translation << 0., 0., 0., 1., 1., 1.;
+
+  // Revolute arm, translation ellipsoid
+  std::tie(mb, mbc) = makeZXZArm();
+  tasks::ManipulabilityEllipsoidTask zxz(mb, "b3", X_b_f, {}, translation, Type::Force);
+  BOOST_CHECK(zxz.type() == Type::Force);
+  testEllipsoidNumDiff(mb, mbc, zxz);
+
+  for(bool isFixed : {true, false})
+  {
+    std::tie(mb, mbc) = makeManipulabilityArm(isFixed);
+
+    tasks::ManipulabilityEllipsoidTask trans(mb, "b7", X_b_f, {}, translation, Type::Force);
+    testEllipsoidNumDiff(mb, mbc, trans);
+
+    // All axes, and an [rz x y] selection
+    tasks::ManipulabilityEllipsoidTask all(mb, "b7", X_b_f, {}, Vector6d::Ones(), Type::Force);
+    testEllipsoidNumDiff(mb, mbc, all);
+    Vector6d planar;
+    planar << 0., 0., 1., 1., 1., 0.;
+    tasks::ManipulabilityEllipsoidTask planarTask(mb, "b7", X_b_f, {}, planar, Type::Force);
+    testEllipsoidNumDiff(mb, mbc, planarTask);
+
+    // Measure joints with non measure joints in between and after, and torque scaling
+    tasks::ManipulabilityEllipsoidTask subset(mb, "b7", X_b_f, {"j6", "j2", "j3", "j1"}, translation, Type::Force);
+    subset.maxJointTorque(VectorXd::LinSpaced(7, 5., 50.));
+    testEllipsoidNumDiff(mb, mbc, subset);
+
+    if(!isFixed)
+    {
+      // In world coordinates, as the velocity ellipsoid
+      randomManipulabilityState(mb, mbc);
+      trans.update(mb, mbc);
+      BOOST_CHECK_SMALL(trans.jac().block(0, 3, trans.jac().rows(), 3).norm(), 1e-10);
+      BOOST_CHECK_GT(trans.jac().block(0, 0, trans.jac().rows(), 3).norm(), 1e-3);
+    }
+  }
+
+  // The force ellipsoid is the regularized inverse of the velocity ellipsoid with the columns scaled by the inverse
+  // torques
+  std::tie(mb, mbc) = makeManipulabilityArm(true);
+  const std::vector<std::string> joints = {"j6", "j2", "j3", "j1"};
+  const VectorXd torque = VectorXd::LinSpaced(7, 5., 50.);
+  tasks::ManipulabilityEllipsoidTask force(mb, "b7", X_b_f, joints, translation, Type::Force);
+  tasks::ManipulabilityEllipsoidTask velocity(mb, "b7", X_b_f, joints, translation, Type::Velocity);
+  force.maxJointTorque(torque);
+  velocity.maxJointVelocity(torque.cwiseInverse());
+  BOOST_CHECK(force.maxJointTorque() == torque);
+  const MatrixXd I3 = MatrixXd::Identity(3, 3);
+  for(int i = 0; i < 10; ++i)
+  {
+    randomManipulabilityState(mb, mbc);
+    force.update(mb, mbc);
+    velocity.update(mb, mbc);
+    const MatrixXd & N = velocity.ellipsoid();
+    const MatrixXd & M = force.ellipsoid();
+    BOOST_CHECK(spd::isSPD(M));
+    BOOST_CHECK_SMALL((M * (N + 1e-6 * N.trace() / 3. * I3) - I3).norm(), 1e-8);
+  }
+
+  // Each scaling applies to its own ellipsoid
+  BOOST_CHECK_THROW(force.maxJointVelocity(VectorXd::Ones(7)), std::domain_error);
+  BOOST_CHECK_THROW(velocity.maxJointTorque(VectorXd::Ones(7)), std::domain_error);
+  BOOST_CHECK_THROW(force.maxJointTorque(VectorXd::Ones(3)), std::domain_error);
+  BOOST_CHECK_THROW(force.maxJointTorque(VectorXd::Zero(7)), std::domain_error);
+  BOOST_CHECK_THROW(force.maxJointTorque(VectorXd::Constant(7, std::numeric_limits<double>::infinity())),
+                    std::domain_error);
+}
+
 BOOST_AUTO_TEST_CASE(ManipulabilityEllipsoidTaskSingularTest)
 {
   using namespace Eigen;
@@ -951,6 +1038,30 @@ BOOST_AUTO_TEST_CASE(ManipulabilityEllipsoidTaskSingularTest)
     BOOST_CHECK_SMALL((singular.target() - singular.ellipsoid()).norm(),
                       1e-5 * std::max(1., singular.ellipsoid().norm()));
   }
+
+  // The force ellipsoid of the same frame stays bounded: its largest eigenvalue is 1 / eps, eps = 1e-6 tr(N) / 3
+  tasks::ManipulabilityEllipsoidTask singularForce(mb, "b7", sva::PTransformd::Identity(), {"j1", "j3", "j7"}, rotation,
+                                                   tasks::ManipulabilityEllipsoidType::Force);
+  for(int i = 0; i < 10; ++i)
+  {
+    randomManipulabilityState(mb, mbc);
+    singular.update(mb, mbc);
+    singularForce.update(mb, mbc);
+    const double maxEigenvalue = 3. / (1e-6 * singular.ellipsoid().trace());
+    SelfAdjointEigenSolver<MatrixXd> es(singularForce.ellipsoid());
+    BOOST_CHECK_GT(es.eigenvalues().minCoeff(), 0.);
+    BOOST_CHECK_CLOSE(es.eigenvalues().maxCoeff(), maxEigenvalue, 1e-3);
+    BOOST_CHECK(singularForce.eval().allFinite());
+    BOOST_CHECK(std::isfinite(singularForce.distance()));
+    BOOST_CHECK(singularForce.jac().allFinite());
+    BOOST_CHECK(singularForce.speed().allFinite());
+    BOOST_CHECK(singularForce.normalAcc().allFinite());
+    singularForce.resetTarget();
+    BOOST_CHECK(tasks::spd::isSPD(singularForce.target()));
+  }
+  // Along the null direction s of N, s^T dN/dq s is zero and the derivatives of M come from the regularization only.
+  // The condition number of N + eps I is about 1e6, which leaves about 1e-5 of relative precision in double
+  testEllipsoidNumDiff(mb, mbc, singularForce, 5, 1e-3);
 
   // Invalid definitions and targets
   const sva::PTransformd I = sva::PTransformd::Identity();

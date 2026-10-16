@@ -883,7 +883,9 @@ private:
 enum class ManipulabilityEllipsoidType
 {
   /** Velocity manipulability ellipsoid \f$ M = \tilde{J}\tilde{J}^T \f$ */
-  Velocity
+  Velocity,
+  /** Force manipulability ellipsoid \f$ M = (\tilde{J}\tilde{J}^T)^{-1} \f$, regularized at singular configurations */
+  Force
 };
 
 /** Errors between the manipulability ellipsoid M and its target \f$ \hat{M} \f$ */
@@ -906,10 +908,17 @@ enum class ManipulabilityEllipsoidError
  * - \f$ J_f \f$ is the Jacobian of the frame in frame coordinates, and \f$ R \f$ rotates its rows to world axes: the
  *   rows of \f$ R J_f \f$ are the angular and linear velocities of the frame origin in world coordinates
  * - \f$ P \f$ selects the world axes and \f$ S \f$ the columns of the measure joints
- * - \f$ \Theta = \mathrm{diag}(\dot{\theta}_0) \f$ scales the columns by the maximum joint velocities (identity by
- *   default)
+ * - \f$ \Theta \f$ scales the columns: \f$ \Theta = \mathrm{diag}(\dot{\theta}_0) \f$ with the maximum joint velocities
+ *   for the velocity ellipsoid, \f$ \Theta = \mathrm{diag}(1 / \tau_0) \f$ with the maximum joint torques for the force
+ *   ellipsoid (identity by default)
  *
- * For the velocity ellipsoid, \f$ M = \tilde{J}\tilde{J}^T \f$ is a D x D matrix, D the number of selected axes.
+ * For D selected axes, \f$ N = \tilde{J}\tilde{J}^T \f$ is a D x D matrix. The velocity ellipsoid is \f$ M = N \f$.
+ * The force ellipsoid is its inverse (Jaquier et al., eqs. 35 and 52). With the translation axes, it holds the forces
+ * at the frame origin, with zero moment, that the measure joints balance with torques
+ * \f$ \|\mathrm{diag}(1 / \tau_0) \, \tau\| \le 1 \f$. The axes are selected before the inversion, so this is not a
+ * block of the inverse of the 6D N. The force ellipsoid is regularized so that it stays finite at singular
+ * configurations, \f$ M = (N + \epsilon I)^{-1} \f$ with \f$ \epsilon = 10^{-6} \, \mathrm{tr}(N) / D \f$, which
+ * changes it by a relative 1e-6 times the condition number of N at most.
  *
  * The task works on the Mandel vectorization vec() of symmetric matrices (see tasks::spd::vec): eval() is
  * \f$ \mathrm{vec}(\mathrm{Log}_M(\hat{M})) \f$ (or \f$ \mathrm{vec}(\hat{M} - M) \f$ with the Euclidean error),
@@ -963,12 +972,22 @@ public:
   ManipulabilityEllipsoidError error() const;
 
   /** Set the maximum velocity \f$ \dot{\theta}_0 \f$ of each measure joint degree of freedom, ordered as
-   * measureJoints()
+   * measureJoints(), for the velocity ellipsoid
    *
-   * @throw std::domain_error if the size is not measureDof() or an entry is not strictly positive
+   * @throw std::domain_error if the ellipsoid is not the velocity ellipsoid, the size is not measureDof() or an entry
+   * is not strictly positive and finite
    */
   void maxJointVelocity(const Eigen::VectorXd & velocity);
   const Eigen::VectorXd & maxJointVelocity() const;
+
+  /** Set the maximum torque \f$ \tau_0 \f$ of each measure joint degree of freedom, ordered as measureJoints(), for the
+   * force ellipsoid
+   *
+   * @throw std::domain_error if the ellipsoid is not the force ellipsoid, the size is not measureDof() or an entry is
+   * not strictly positive and finite
+   */
+  void maxJointTorque(const Eigen::VectorXd & torque);
+  const Eigen::VectorXd & maxJointTorque() const;
 
   ManipulabilityEllipsoidType type() const;
   const Eigen::Vector6d & axes() const;
@@ -990,6 +1009,9 @@ private:
   ManipulabilityEllipsoidType type_;
   ManipulabilityEllipsoidError error_;
   Eigen::VectorXd maxJointVelocity_;
+  Eigen::VectorXd maxJointTorque_;
+  /** Diagonal of \f$ \Theta \f$ */
+  Eigen::VectorXd scale_;
 
   Eigen::MatrixXd target_;
   Eigen::MatrixXd M_;
