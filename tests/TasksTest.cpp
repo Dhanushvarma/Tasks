@@ -532,8 +532,9 @@ BOOST_AUTO_TEST_CASE(VectorOrientationTaskTest)
   testTaskNumDiff(mb, mbc, vot, NormalAccUpdater<tasks::VectorOrientationTask>(mb), VectOriTester());
 }
 
-/// @return A branched arm with every RBDyn joint type on the path to "b7" and a side branch "b8"
-std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeManipulabilityArm(bool isFixed)
+/// @return A branched arm with every RBDyn joint type on the path to "b7" and a side branch "b8", with a second side
+/// branch "b9" from "b1" if sideB1 is true (the spherical joint j2 is then on the path to b7 only)
+std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeManipulabilityArm(bool isFixed, bool sideB1 = false)
 {
   using namespace Eigen;
   using namespace sva;
@@ -561,6 +562,12 @@ std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeManipulabilityArm(bool isFi
   mbg.linkBodies("b5", offset(0.4, -0.7, Vector3d(0.1, 0.3, 0.)), "b6", PTransformd::Identity(), "j6");
   mbg.linkBodies("b6", offset(-0.2, 0.3, Vector3d(0.25, 0., 0.15)), "b7", PTransformd::Identity(), "j7");
   mbg.linkBodies("b3", offset(0., 0., Vector3d(0., -0.3, 0.)), "b8", PTransformd::Identity(), "j8");
+  if(sideB1)
+  {
+    mbg.addBody(Body(rbi, "b9"));
+    mbg.addJoint(Joint(Joint::Rev, Vector3d(0., 1., 1.).normalized(), true, "j9"));
+    mbg.linkBodies("b1", offset(0.5, -0.4, Vector3d(-0.2, 0.1, 0.35)), "b9", PTransformd::Identity(), "j9");
+  }
 
   MultiBody mb = mbg.makeMultiBody("b0", isFixed);
   MultiBodyConfig mbc(mb);
@@ -1073,4 +1080,215 @@ BOOST_AUTO_TEST_CASE(ManipulabilityEllipsoidTaskSingularTest)
   BOOST_CHECK_THROW(task.target(-MatrixXd::Identity(3, 3)), std::domain_error);
   BOOST_CHECK_THROW(task.maxJointVelocity(VectorXd::Ones(3)), std::domain_error);
   BOOST_CHECK_THROW(task.maxJointVelocity(VectorXd::Zero(12)), std::domain_error);
+}
+
+/// Pose of frame f in the coordinates of frame r after integrating mbc over step (backward in time if step is negative)
+sva::PTransformd relativePoseAfterStep(const rbd::MultiBody & mb,
+                                       const rbd::MultiBodyConfig & mbc,
+                                       double step,
+                                       const std::string & body,
+                                       const sva::PTransformd & X_b_f,
+                                       const std::string & refBody,
+                                       const sva::PTransformd & X_rb_r)
+{
+  rbd::MultiBodyConfig mbcStep(mbc);
+  if(step < 0) { rbd::vectorToParam(-rbd::dofToVector(mb, mbcStep.alpha), mbcStep.alpha); }
+  rbd::integration(mb, mbcStep, std::abs(step));
+  rbd::forwardKinematics(mb, mbcStep);
+  const sva::PTransformd X_0_f = X_b_f * mbcStep.bodyPosW[static_cast<std::size_t>(mb.bodyIndexByName(body))];
+  const sva::PTransformd X_0_r = X_rb_r * mbcStep.bodyPosW[static_cast<std::size_t>(mb.bodyIndexByName(refBody))];
+  return X_0_f * X_0_r.inv();
+}
+
+BOOST_AUTO_TEST_CASE(ManipulabilityRelativeEllipsoidTaskTest)
+{
+  using namespace Eigen;
+  using namespace rbd;
+  using Type = tasks::ManipulabilityEllipsoidType;
+
+  MultiBody mb;
+  MultiBodyConfig mbc;
+  const sva::PTransformd X_b_f(sva::RotY(0.4) * sva::RotZ(-0.3), Vector3d(0.1, -0.05, 0.2));
+  const sva::PTransformd X_rb_r(sva::RotX(-0.6) * sva::RotZ(0.2), Vector3d(-0.15, 0.1, 0.05));
+  Vector6d translation;
+  translation << 0., 0., 0., 1., 1., 1.;
+
+  for(bool isFixed : {true, false})
+  {
+    std::tie(mb, mbc) = makeManipulabilityArm(isFixed);
+
+    // b7 relative to the side branch b8: the joints both paths share (the root, j1, j2 and j3) are not measure joints
+    tasks::ManipulabilityEllipsoidTask rel(mb, "b7", X_b_f, {}, translation, Type::Velocity, "b8", X_rb_r);
+    BOOST_CHECK(rel.relative());
+    BOOST_CHECK(rel.measureJoints() == std::vector<std::string>({"j8", "j4", "j5", "j6", "j7"}));
+    BOOST_CHECK_EQUAL(rel.measureDof(), 8);
+    testEllipsoidNumDiff(mb, mbc, rel);
+    // ... and do not change the ellipsoid: moving them alone keeps it
+    randomManipulabilityState(mb, mbc);
+    rel.update(mb, mbc);
+    const MatrixXd before = rel.ellipsoid();
+    const Jacobian sharedPath(mb, "b3");
+    MultiBodyConfig mbcShared(mbc);
+    rbd::vectorToParam(VectorXd::Zero(mb.nrDof()), mbcShared.alpha);
+    rbd::vectorToParam(VectorXd::Zero(mb.nrDof()), mbcShared.alphaD);
+    for(int j : sharedPath.jointsPath())
+    {
+      for(auto & a : mbcShared.alpha[static_cast<std::size_t>(j)]) { a = 1.; }
+    }
+    rbd::integration(mb, mbcShared, 0.3);
+    rbd::forwardKinematics(mb, mbcShared);
+    rbd::forwardVelocity(mb, mbcShared);
+    rel.update(mb, mbcShared);
+    BOOST_CHECK_SMALL((rel.ellipsoid() - before).norm(), 1e-10 * std::max(1., before.norm()));
+    BOOST_CHECK_SMALL(rel.speed().norm(), 1e-10 * std::max(1., before.norm()));
+
+    // All axes, the force ellipsoid with torque scaling
+    tasks::ManipulabilityEllipsoidTask relAll(mb, "b7", X_b_f, {}, Vector6d::Ones(), Type::Velocity, "b8", X_rb_r);
+    testEllipsoidNumDiff(mb, mbc, relAll);
+    tasks::ManipulabilityEllipsoidTask relForce(mb, "b7", X_b_f, {}, translation, Type::Force, "b8", X_rb_r);
+    relForce.maxJointTorque(VectorXd::LinSpaced(8, 5., 50.));
+    testEllipsoidNumDiff(mb, mbc, relForce);
+
+    // The other way around, with the planar and cylindrical joints on the reference side
+    tasks::ManipulabilityEllipsoidTask inv(mb, "b8", X_rb_r, {}, translation, Type::Velocity, "b7", X_b_f);
+    BOOST_CHECK(inv.measureJoints() == std::vector<std::string>({"j4", "j5", "j6", "j7", "j8"}));
+    testEllipsoidNumDiff(mb, mbc, inv);
+    tasks::ManipulabilityEllipsoidTask invAll(mb, "b8", X_rb_r, {}, Vector6d::Ones(), Type::Force, "b7", X_b_f);
+    testEllipsoidNumDiff(mb, mbc, invAll);
+
+    // Reference body on the path to the frame body, and the opposite
+    tasks::ManipulabilityEllipsoidTask down(mb, "b7", X_b_f, {}, translation, Type::Velocity, "b4", X_rb_r);
+    BOOST_CHECK(down.measureJoints() == std::vector<std::string>({"j5", "j6", "j7"}));
+    testEllipsoidNumDiff(mb, mbc, down);
+    tasks::ManipulabilityEllipsoidTask up(mb, "b4", X_rb_r, {}, translation, Type::Force, "b7", X_b_f);
+    BOOST_CHECK(up.measureJoints() == std::vector<std::string>({"j5", "j6", "j7"}));
+    testEllipsoidNumDiff(mb, mbc, up);
+
+    // Measure joints on both sides, ordered as the path, with velocity scaling
+    tasks::ManipulabilityEllipsoidTask subset(mb, "b7", X_b_f, {"j7", "j8", "j5"}, translation, Type::Velocity, "b8",
+                                              X_rb_r);
+    BOOST_CHECK(subset.measureJoints() == std::vector<std::string>({"j8", "j5", "j7"}));
+    subset.maxJointVelocity(VectorXd::LinSpaced(5, 0.5, 2.));
+    testEllipsoidNumDiff(mb, mbc, subset);
+  }
+
+  // The spherical joint j2 on one side only: b7 relative to b9 and b9 relative to b7
+  for(bool isFixed : {true, false})
+  {
+    std::tie(mb, mbc) = makeManipulabilityArm(isFixed, true);
+    tasks::ManipulabilityEllipsoidTask sphFrame(mb, "b7", X_b_f, {}, translation, Type::Velocity, "b9", X_rb_r);
+    BOOST_CHECK(sphFrame.measureJoints() == std::vector<std::string>({"j9", "j2", "j3", "j4", "j5", "j6", "j7"}));
+    testEllipsoidNumDiff(mb, mbc, sphFrame);
+    tasks::ManipulabilityEllipsoidTask sphRef(mb, "b9", X_rb_r, {}, Vector6d::Ones(), Type::Velocity, "b7", X_b_f);
+    BOOST_CHECK(sphRef.measureJoints() == std::vector<std::string>({"j2", "j3", "j4", "j5", "j6", "j7", "j9"}));
+    testEllipsoidNumDiff(mb, mbc, sphRef);
+    tasks::ManipulabilityEllipsoidTask sphRefForce(mb, "b9", X_rb_r, {}, translation, Type::Force, "b7", X_b_f);
+    testEllipsoidNumDiff(mb, mbc, sphRefForce);
+  }
+
+  // R J alpha is the velocity of the frame relative to the reference frame, in reference frame coordinates
+  std::tie(mb, mbc) = makeManipulabilityArm(false);
+  tasks::FrameJacobianDerivatives frameJac(mb, "b7", X_b_f, {}, Vector6d::Ones(), "test", "b8", X_rb_r);
+  const double step = 1e-6;
+  for(int i = 0; i < 10; ++i)
+  {
+    randomManipulabilityState(mb, mbc);
+    frameJac.update(mb, mbc);
+    const Matrix3d R = frameJac.X_r_f().rotation().transpose();
+    const Vector6d V = frameJac.jacobian() * frameJac.alpha();
+    const sva::PTransformd post = relativePoseAfterStep(mb, mbc, step, "b7", X_b_f, "b8", X_rb_r);
+    const sva::PTransformd pre = relativePoseAfterStep(mb, mbc, -step, "b7", X_b_f, "b8", X_rb_r);
+    const AngleAxisd dR(Matrix3d(post.rotation().transpose() * pre.rotation()));
+    BOOST_CHECK_SMALL((R * V.head<3>() - dR.angle() * dR.axis() / (2 * step)).norm(), 1e-6);
+    BOOST_CHECK_SMALL((R * V.tail<3>() - (post.translation() - pre.translation()) / (2 * step)).norm(), 1e-6);
+  }
+  // The same with the spherical joint on the reference side
+  {
+    MultiBody mbSph;
+    MultiBodyConfig mbcSph;
+    std::tie(mbSph, mbcSph) = makeManipulabilityArm(false, true);
+    tasks::FrameJacobianDerivatives sphJac(mbSph, "b9", X_rb_r, {}, Vector6d::Ones(), "test", "b7", X_b_f);
+    for(int i = 0; i < 10; ++i)
+    {
+      randomManipulabilityState(mbSph, mbcSph);
+      sphJac.update(mbSph, mbcSph);
+      const Matrix3d R = sphJac.X_r_f().rotation().transpose();
+      const Vector6d V = sphJac.jacobian() * sphJac.alpha();
+      const sva::PTransformd post = relativePoseAfterStep(mbSph, mbcSph, step, "b9", X_rb_r, "b7", X_b_f);
+      const sva::PTransformd pre = relativePoseAfterStep(mbSph, mbcSph, -step, "b9", X_rb_r, "b7", X_b_f);
+      const AngleAxisd dR(Matrix3d(post.rotation().transpose() * pre.rotation()));
+      BOOST_CHECK_SMALL((R * V.head<3>() - dR.angle() * dR.axis() / (2 * step)).norm(), 1e-6);
+      BOOST_CHECK_SMALL((R * V.tail<3>() - (post.translation() - pre.translation()) / (2 * step)).norm(), 1e-6);
+    }
+  }
+
+  // It is the relative Jacobian of Li et al. (ManiDP, eq. 3) computed from the Jacobians of both frames in world
+  // coordinates: with rows ordered as (linear, angular) velocity, J = -Psi Omega J_r + Omega J_f, where Omega rotates
+  // world to reference frame coordinates and Psi = [I -S(p); 0 I] with p the frame position in the reference frame
+  auto worldJacobian = [&](const std::string & body, const sva::PTransformd & X_0_p)
+  {
+    Jacobian jac(mb, body);
+    const MatrixXd J = jac.jacobian(mb, mbc, sva::PTransformd(Matrix3d::Identity(), X_0_p.translation()));
+    MatrixXd full(6, mb.nrDof());
+    jac.fullJacobian(mb, J, full);
+    MatrixXd res(6, mb.nrDof());
+    res << full.bottomRows<3>(), full.topRows<3>();
+    return res;
+  };
+  tasks::ManipulabilityEllipsoidTask rel(mb, "b7", X_b_f, {}, translation, Type::Velocity, "b8", X_rb_r);
+  for(int i = 0; i < 10; ++i)
+  {
+    randomManipulabilityState(mb, mbc);
+    frameJac.update(mb, mbc);
+    rel.update(mb, mbc);
+    const sva::PTransformd X_0_f = X_b_f * mbc.bodyPosW[static_cast<std::size_t>(mb.bodyIndexByName("b7"))];
+    const sva::PTransformd X_0_r = X_rb_r * mbc.bodyPosW[static_cast<std::size_t>(mb.bodyIndexByName("b8"))];
+    Matrix6d Omega = Matrix6d::Zero();
+    Omega.topLeftCorner<3, 3>() = X_0_r.rotation();
+    Omega.bottomRightCorner<3, 3>() = X_0_r.rotation();
+    Matrix6d Psi = Matrix6d::Identity();
+    Psi.topRightCorner<3, 3>() =
+        -sva::vector3ToCrossMatrix(Vector3d(X_0_r.rotation() * (X_0_f.translation() - X_0_r.translation())));
+    const MatrixXd JManiDP = -Psi * Omega * worldJacobian("b8", X_0_r) + Omega * worldJacobian("b7", X_0_f);
+
+    const Matrix3d R = frameJac.X_r_f().rotation().transpose();
+    MatrixXd RJ(6, frameJac.jacobian().cols());
+    RJ << R * frameJac.jacobian().bottomRows<3>(), R * frameJac.jacobian().topRows<3>();
+    MatrixXd full(6, mb.nrDof());
+    frameJac.fullJacobian(mb, RJ, full);
+    BOOST_CHECK_SMALL((full - JManiDP).norm(), 1e-10);
+    // The translation velocity ellipsoid is ManiDP's bimanual relative manipulability (eq. 2) with W = I
+    const MatrixXd Jv = JManiDP.topRows<3>();
+    BOOST_CHECK_SMALL((rel.ellipsoid() - Jv * Jv.transpose()).norm(), 1e-10);
+  }
+
+  // Relative to the fixed root body, the ellipsoid is the one in world coordinates
+  std::tie(mb, mbc) = makeManipulabilityArm(true);
+  tasks::ManipulabilityEllipsoidTask world(mb, "b7", X_b_f, {}, translation, Type::Force);
+  tasks::ManipulabilityEllipsoidTask root(mb, "b7", X_b_f, {}, translation, Type::Force, "b0");
+  BOOST_CHECK(root.measureJoints() == world.measureJoints());
+  for(int i = 0; i < 5; ++i)
+  {
+    randomManipulabilityState(mb, mbc);
+    world.update(mb, mbc);
+    root.update(mb, mbc);
+    const double scale = std::max(1., world.ellipsoid().norm());
+    BOOST_CHECK_SMALL((root.ellipsoid() - world.ellipsoid()).norm(), 1e-10 * scale);
+    BOOST_CHECK_SMALL((root.jac() - world.jac()).norm(), 1e-10 * std::max(scale, world.jac().norm()));
+    BOOST_CHECK_SMALL((root.speed() - world.speed()).norm(), 1e-10 * std::max(scale, world.speed().norm()));
+    BOOST_CHECK_SMALL((root.normalAcc() - world.normalAcc()).norm(), 1e-10 * std::max(scale, world.normalAcc().norm()));
+  }
+
+  // Joints shared by both paths and frames on the same body cannot define the ellipsoid
+  const sva::PTransformd I = sva::PTransformd::Identity();
+  BOOST_CHECK_THROW(
+      tasks::ManipulabilityEllipsoidTask(mb, "b7", I, {"j1", "j4", "j5"}, translation, Type::Velocity, "b8"),
+      std::domain_error);
+  auto noJoint = [](const std::domain_error & e)
+  {
+    return std::string(e.what()).find("no joint with a degree of freedom between body b7 and body b7")
+           != std::string::npos;
+  };
+  BOOST_CHECK_EXCEPTION(tasks::ManipulabilityEllipsoidTask(mb, "b7", I, {}, translation, Type::Velocity, "b7", X_rb_r),
+                        std::domain_error, noJoint);
 }

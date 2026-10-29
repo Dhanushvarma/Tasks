@@ -1574,8 +1574,10 @@ ManipulabilityEllipsoidTask::ManipulabilityEllipsoidTask(const std::vector<rbd::
                                                          const sva::PTransformd & X_b_f,
                                                          const std::vector<std::string> & measureJoints,
                                                          const Eigen::Vector6d & axes,
-                                                         ManipulabilityEllipsoidType type)
-: met_(mbs[rI], bodyName, X_b_f, measureJoints, axes, type), robotIndex_(rI)
+                                                         ManipulabilityEllipsoidType type,
+                                                         const std::string & refBodyName,
+                                                         const sva::PTransformd & X_rb_r)
+: met_(mbs[rI], bodyName, X_b_f, measureJoints, axes, type, refBodyName, X_rb_r), robotIndex_(rI)
 {
 }
 

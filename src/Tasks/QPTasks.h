@@ -1162,7 +1162,9 @@ public:
                               const sva::PTransformd & X_b_f = sva::PTransformd::Identity(),
                               const std::vector<std::string> & measureJoints = {},
                               const Eigen::Vector6d & axes = (Eigen::Vector6d() << 0., 0., 0., 1., 1., 1.).finished(),
-                              ManipulabilityEllipsoidType type = ManipulabilityEllipsoidType::Velocity);
+                              ManipulabilityEllipsoidType type = ManipulabilityEllipsoidType::Velocity,
+                              const std::string & refBodyName = "",
+                              const sva::PTransformd & X_rb_r = sva::PTransformd::Identity());
 
   tasks::ManipulabilityEllipsoidTask & task() { return met_; }
 

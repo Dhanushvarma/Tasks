@@ -1891,3 +1891,68 @@ BOOST_AUTO_TEST_CASE(QPManipulabilityForceEllipsoidTaskTest)
   BOOST_CHECK_SMALL(manipTask.distance(), 1e-3);
   BOOST_CHECK_SMALL(manipTask.speed().norm(), 1e-3 * manipTask.ellipsoid().norm());
 }
+
+BOOST_AUTO_TEST_CASE(QPManipulabilityRelativeEllipsoidTaskTest)
+{
+  using namespace Eigen;
+  using namespace sva;
+  using namespace rbd;
+  using namespace tasks;
+
+  MultiBody mb;
+  MultiBodyConfig mbcInit;
+  std::tie(mb, mbcInit) = makeTwoArms();
+  auto setPosture = [&mb](MultiBodyConfig & mbc, const std::vector<double> & q)
+  {
+    const std::vector<std::string> joints = {"jl1", "jl2", "jl3", "jr1", "jr2", "jr3"};
+    for(std::size_t i = 0; i < joints.size(); ++i)
+    {
+      mbc.q[static_cast<std::size_t>(mb.jointIndexByName(joints[i]))] = {q[i]};
+    }
+    forwardKinematics(mb, mbc);
+    forwardVelocity(mb, mbc);
+  };
+  setPosture(mbcInit, {0.1, 0.4, 0.3, -0.2, 0.5, -0.3});
+  MultiBodyConfig mbcTarget(mbcInit);
+  setPosture(mbcTarget, {0.25, 0.3, 0.45, -0.05, 0.65, -0.15});
+
+  // Translation ellipsoid of the right tip relative to the left tip, velocity then force, the target is the ellipsoid
+  // of a nearby configuration
+  const PTransformd tip(Vector3d(0., 0.5, 0.));
+  Vector6d translation;
+  translation << 0., 0., 0., 1., 1., 1.;
+  for(auto type : {ManipulabilityEllipsoidType::Velocity, ManipulabilityEllipsoidType::Force})
+  {
+    std::vector<MultiBody> mbs = {mb};
+    std::vector<MultiBodyConfig> mbcs = {mbcInit};
+
+    qp::QPSolver solver;
+    solver.nrVars(mbs, {}, {});
+    solver.updateConstrSize();
+
+    qp::ManipulabilityEllipsoidTask manipTask(mbs, 0, "r3", tip, {}, translation, type, "l3", tip);
+    BOOST_CHECK_EQUAL(manipTask.task().measureDof(), 6);
+    manipTask.task().update(mb, mbcTarget);
+    manipTask.target(manipTask.ellipsoid());
+    manipTask.update(mbs, mbcs, solver.data());
+    const double d0 = manipTask.distance();
+
+    qp::SetPointTask manipTaskSp(mbs, 0, &manipTask, 10., 1.);
+    qp::PostureTask postureTask(mbs, 0, mbcInit.q, 0., 1e-3);
+    postureTask.gains(0., 2.);
+    solver.addTask(&manipTaskSp);
+    solver.addTask(&postureTask);
+
+    for(int i = 0; i < 10000; ++i)
+    {
+      BOOST_REQUIRE(solver.solve(mbs, mbcs));
+      integration(mb, mbcs[0], 0.001);
+      forwardKinematics(mb, mbcs[0]);
+      forwardVelocity(mb, mbcs[0]);
+    }
+    manipTask.update(mbs, mbcs, solver.data());
+    BOOST_CHECK_GT(d0, 0.1);
+    BOOST_CHECK_SMALL(manipTask.distance(), 1e-3);
+    BOOST_CHECK_SMALL(manipTask.speed().norm(), 1e-3 * manipTask.ellipsoid().norm());
+  }
+}

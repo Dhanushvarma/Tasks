@@ -692,6 +692,15 @@ private:
  * The column of a path degree of freedom c only depends on the joints after its own joint,
  * \f$ \partial J_c / \partial q_k = J_c \times J_k \f$ (motion cross product) for k after c, so the time derivatives
  * come from one backward pass over the path.
+ *
+ * With a reference frame r, the Jacobian is the one of the frame f relative to r, still in frame coordinates:
+ * \f$ J = J_f - X_{r \to f} J_r \f$, where \f$ J_r \f$ is the Jacobian of r in its own coordinates and
+ * \f$ X_{r \to f} \f$ transforms motion vectors from r to f coordinates. This is the relative Jacobian of Jamisola and
+ * Roberts ("A more compact expression of relative Jacobian based on individual manipulator Jacobians", RAS 2015), in
+ * frame coordinates. The path is then made of the joints between the two bodies: the joints between the root and the
+ * reference body that are not between the root and the frame body (ordered from the root to the reference body), then
+ * the joints between the root and the frame body that are not between the root and the reference body. The joints
+ * shared by both paths move both frames together, they do not change J.
  */
 class TASKS_DLLAPI FrameJacobianDerivatives
 {
@@ -700,26 +709,31 @@ public:
    * @param mb Robot
    * @param bodyName Body the frame is attached to
    * @param X_b_f Frame pose in body coordinates
-   * @param measureJoints Measure joints. If empty, every joint between the root and the body, excluding a free root
-   * joint (floating base)
+   * @param measureJoints Measure joints. If empty, every joint of the path, excluding a free root joint (floating base)
    * @param axes Selected axes, ordered as sva::MotionVecd (rotation then translation). A non-zero entry selects the
    * axis
    * @param owner Name used in error messages
-   * @throw std::domain_error if a measure joint is not between the root and the body, appears twice or has no degree of
-   * freedom, or if more axes are selected than measure joints degrees of freedom
+   * @param refBodyName Body the reference frame is attached to. If empty, the Jacobian is the one of the frame
+   * (relative to the world)
+   * @param X_rb_r Reference frame pose in the coordinates of its body
+   * @throw std::domain_error if a measure joint is not on the path, appears twice or has no degree of freedom, or if
+   * more axes are selected than measure joints degrees of freedom
    */
   FrameJacobianDerivatives(const rbd::MultiBody & mb,
                            const std::string & bodyName,
                            const sva::PTransformd & X_b_f,
                            const std::vector<std::string> & measureJoints,
                            const Eigen::Vector6d & axes,
-                           const std::string & owner);
+                           const std::string & owner,
+                           const std::string & refBodyName = "",
+                           const sva::PTransformd & X_rb_r = sva::PTransformd::Identity());
 
   /** Compute the frame pose, the frame Jacobian, its time derivative and its second time derivative at zero joint
    * acceleration */
   void update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc);
 
-  /** Frame Jacobian in frame coordinates, one column per path degree of freedom */
+  /** Frame Jacobian in frame coordinates, one column per path degree of freedom (relative to the reference frame if
+   * there is one) */
   const Eigen::MatrixXd & jacobian() const { return J_; }
   /** Time derivative of jacobian() */
   const Eigen::MatrixXd & jacobianDot() const { return jacDot_; }
@@ -729,6 +743,21 @@ public:
   const Eigen::VectorXd & alpha() const { return alpha_; }
   /** Frame pose in world coordinates */
   const sva::PTransformd & X_0_f() const { return X_0_f_; }
+  /** Frame pose in reference frame coordinates, in world coordinates without a reference frame */
+  const sva::PTransformd & X_r_f() const { return relative_ ? X_r_f_ : X_0_f_; }
+  /** True if the Jacobian is relative to a reference frame */
+  bool relative() const { return relative_; }
+
+  /** Partial derivative of the path column c of jacobian() with respect to the path degree of freedom k, a motion cross
+   * product of the two columns or zero. Without a reference frame it is not zero when the joint of k is after the joint
+   * of c. With a reference frame the path from the reference body to the frame body acts as one chain: a column on the
+   * frame side depends on the frame side joints after its own joint, a column on the reference side depends on the
+   * other degrees of freedom of its own joint, on the reference side joints closer to the root and on every frame side
+   * joint.
+   *
+   * @return false if the derivative is zero, d is then unchanged
+   */
+  bool columnDerivative(int c, int k, Eigen::Vector6d & d) const;
 
   /** Number of degrees of freedom of each joint of the path */
   const std::vector<int> & jointDof() const { return jointDof_; }
@@ -740,7 +769,7 @@ public:
   const std::vector<int> & rows() const { return rows_; }
   /** Path columns of the measure joints */
   const std::vector<int> & cols() const { return cols_; }
-  /** Measure joints, ordered from the root to the body */
+  /** Measure joints, ordered as the path */
   const std::vector<std::string> & measureJoints() const { return measureJoints_; }
   const Eigen::Vector6d & axes() const { return axes_; }
 
@@ -749,12 +778,35 @@ public:
   void fullJacobian(const rbd::MultiBody & mb, const Eigen::MatrixXd & pathMat, Eigen::MatrixXd & fullMat) const;
 
 private:
+  /** Jacobian of a frame in its own coordinates, over the joints between the root and its body, with its time
+   * derivatives */
+  struct BodyPath
+  {
+    std::vector<int> jointDof;
+    std::vector<int> jointCol;
+    Eigen::MatrixXd J;
+    Eigen::MatrixXd jacDot;
+    Eigen::MatrixXd jacDDot;
+    Eigen::VectorXd alpha;
+  };
+
+  static void initBodyPath(const rbd::MultiBody & mb, const rbd::Jacobian & jac, BodyPath & path);
+  static void updateBodyPath(const rbd::MultiBody & mb,
+                             const rbd::MultiBodyConfig & mbc,
+                             const sva::PTransformd & X_0_p,
+                             rbd::Jacobian & jac,
+                             BodyPath & path);
+  void updateRelative(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc);
+
+private:
   int bodyIndex_;
   sva::PTransformd X_b_f_;
   rbd::Jacobian jac_;
   Eigen::Vector6d axes_;
   std::vector<std::string> measureJoints_;
 
+  /** Joint index of each joint of the path */
+  std::vector<int> path_;
   std::vector<int> jointDof_;
   std::vector<int> jointCol_;
   std::vector<int> colJoint_;
@@ -766,6 +818,25 @@ private:
   Eigen::MatrixXd jacDot_;
   Eigen::MatrixXd jacDDot_;
   Eigen::VectorXd alpha_;
+
+  /** Reference frame */
+  bool relative_;
+  int refBodyIndex_;
+  sva::PTransformd X_rb_r_;
+  rbd::Jacobian refJac_;
+  sva::PTransformd X_r_f_;
+  /** Paths from the root to the frame body and to the reference body */
+  BodyPath framePath_;
+  BodyPath refPath_;
+  /** For each path column: true on the reference side, its column in framePath_ or refPath_, and the index of its joint
+   * in the path from the root to its body */
+  std::vector<bool> colRef_;
+  std::vector<int> colSide_;
+  std::vector<int> colSideJoint_;
+  /** \f$ X_{r \to f} J_r \f$ and its time derivatives on the path columns (zero on the frame side) */
+  Eigen::MatrixXd XJr_;
+  Eigen::MatrixXd XJrDot_;
+  Eigen::MatrixXd XJrDDot_;
 };
 
 /** Manipulability measures supported by ManipulabilityTask */
@@ -920,6 +991,16 @@ enum class ManipulabilityEllipsoidError
  * configurations, \f$ M = (N + \epsilon I)^{-1} \f$ with \f$ \epsilon = 10^{-6} \, \mathrm{tr}(N) / D \f$, which
  * changes it by a relative 1e-6 times the condition number of N at most.
  *
+ * With a reference frame r of the same robot, the ellipsoid is the one of the frame relative to r: \f$ J_f \f$ is the
+ * Jacobian of the frame relative to r (see FrameJacobianDerivatives) and \f$ R \f$ rotates its rows to the axes of r,
+ * so the rows of \f$ R J_f \f$ are the angular and linear velocities of the frame origin relative to r, in r
+ * coordinates, and the selected axes are axes of r. The joints shared by the paths from the root to both frames do not
+ * move one frame relative to the other, they are not measure joints. With a frame on each hand, this is the bimanual
+ * relative manipulability of Li et al. ("ManiDP: Manipulability-Aware Diffusion Policy for Posture-Dependent Bimanual
+ * Manipulation", 2025, eqs. 2 to 4): the velocity ellipsoid describes how fast one hand can move relative to the
+ * other, the force ellipsoid the force one hand can apply against the other, which takes the reaction at the same
+ * point: a squeeze or a pull along the line between the hands, and also a moment across it.
+ *
  * The task works on the Mandel vectorization vec() of symmetric matrices (see tasks::spd::vec): eval() is
  * \f$ \mathrm{vec}(\mathrm{Log}_M(\hat{M})) \f$ (or \f$ \mathrm{vec}(\hat{M} - M) \f$ with the Euclidean error),
  * speed() is \f$ \mathrm{vec}(\dot{M}) \f$, normalAcc() is \f$ \mathrm{vec}(\ddot{M}) \f$ at zero joint acceleration
@@ -934,19 +1015,25 @@ public:
    * @param bodyName Body the frame is attached to
    * @param X_b_f Frame pose in body coordinates
    * @param measureJoints Joints whose Jacobian columns define the ellipsoid. If empty, every joint between the root and
-   * the body, excluding a free root joint (floating base)
-   * @param axes World axes of the ellipsoid, ordered as sva::MotionVecd (rotation then translation). A non-zero entry
-   * selects the axis. Translation by default
+   * the body (between the reference body and the body with a reference frame), excluding a free root joint (floating
+   * base)
+   * @param axes World axes of the ellipsoid (axes of the reference frame with a reference frame), ordered as
+   * sva::MotionVecd (rotation then translation). A non-zero entry selects the axis. Translation by default
    * @param type Manipulability ellipsoid
-   * @throw std::domain_error if a measure joint is not between the root and the body, appears twice or has no degree of
-   * freedom, or if more axes are selected than measure joints degrees of freedom
+   * @param refBodyName Body the reference frame is attached to, for the ellipsoid of the frame relative to the
+   * reference frame. If empty, the ellipsoid is the one of the frame in world axes
+   * @param X_rb_r Reference frame pose in the coordinates of its body
+   * @throw std::domain_error if a measure joint is not between the root (or the reference body) and the body, appears
+   * twice or has no degree of freedom, or if more axes are selected than measure joints degrees of freedom
    */
   ManipulabilityEllipsoidTask(const rbd::MultiBody & mb,
                               const std::string & bodyName,
                               const sva::PTransformd & X_b_f = sva::PTransformd::Identity(),
                               const std::vector<std::string> & measureJoints = {},
                               const Eigen::Vector6d & axes = (Eigen::Vector6d() << 0., 0., 0., 1., 1., 1.).finished(),
-                              ManipulabilityEllipsoidType type = ManipulabilityEllipsoidType::Velocity);
+                              ManipulabilityEllipsoidType type = ManipulabilityEllipsoidType::Velocity,
+                              const std::string & refBodyName = "",
+                              const sva::PTransformd & X_rb_r = sva::PTransformd::Identity());
 
   void update(const rbd::MultiBody & mb, const rbd::MultiBodyConfig & mbc);
 
@@ -991,12 +1078,15 @@ public:
 
   ManipulabilityEllipsoidType type() const;
   const Eigen::Vector6d & axes() const;
-  /** Measure joints, ordered from the root to the body */
+  /** Measure joints, ordered from the root to the body (with a reference frame, the joints on the reference body side
+   * from the root to the reference body, then the joints on the body side) */
   const std::vector<std::string> & measureJoints() const;
   /** Number of degrees of freedom of the measure joints */
   int measureDof() const;
   /** Size D of the ellipsoid matrix, the number of selected axes */
   int size() const;
+  /** True if the ellipsoid is relative to a reference frame */
+  bool relative() const;
 
   const Eigen::VectorXd & eval() const;
   const Eigen::VectorXd & speed() const;
@@ -1025,8 +1115,8 @@ private:
   Eigen::MatrixXd Jt_;
   Eigen::MatrixXd JtDot_;
   Eigen::MatrixXd JtDDot_;
-  /** Partial derivative of \f$ \tilde{J} \f$ with respect to one degree of freedom, in frame then in world coordinates
-   */
+  /** Partial derivative of \f$ \tilde{J} \f$ with respect to one degree of freedom, in frame then in world (or
+   * reference frame) coordinates */
   Eigen::MatrixXd A_;
   Eigen::MatrixXd At_;
   /** Jacobian of vec(M) with respect to the path degrees of freedom */

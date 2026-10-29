@@ -68,6 +68,36 @@ std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeZXZArm(bool isFixed = true,
   return std::make_tuple(mb, mbc);
 }
 
+/// @return Two ZXZ arms on a fixed base b0 with Y as up axis: the left arm l1-l3 (joints jl1-jl3) and the right arm
+/// r1-r3 (joints jr1-jr3), mounted 0.3 m to each side of the base along X.
+std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeTwoArms()
+{
+  using namespace Eigen;
+  using namespace sva;
+  using namespace rbd;
+
+  MultiBodyGraph mbg;
+  RBInertiad rbi(1., Vector3d::Zero(), Matrix3d::Identity());
+  for(const std::string name : {"b0", "l1", "l2", "l3", "r1", "r2", "r3"}) { mbg.addBody(Body(rbi, name)); }
+
+  const PTransformd to(Vector3d(0., 0.5, 0.));
+  for(const std::string side : {"l", "r"})
+  {
+    mbg.addJoint(Joint(Joint::RevZ, true, "j" + side + "1"));
+    mbg.addJoint(Joint(Joint::RevX, true, "j" + side + "2"));
+    mbg.addJoint(Joint(Joint::RevZ, true, "j" + side + "3"));
+    const double x = side == "l" ? -0.3 : 0.3;
+    mbg.linkBodies("b0", PTransformd(Vector3d(x, 0., 0.)), side + "1", PTransformd::Identity(), "j" + side + "1");
+    mbg.linkBodies(side + "1", to, side + "2", PTransformd::Identity(), "j" + side + "2");
+    mbg.linkBodies(side + "2", to, side + "3", PTransformd::Identity(), "j" + side + "3");
+  }
+
+  MultiBody mb = mbg.makeMultiBody("b0", true);
+  MultiBodyConfig mbc(mb);
+  mbc.zero(mb);
+  return std::make_tuple(mb, mbc);
+}
+
 /// @return A one body robot for the environnment.
 std::tuple<rbd::MultiBody, rbd::MultiBodyConfig> makeEnv()
 {
